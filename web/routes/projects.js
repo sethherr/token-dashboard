@@ -1,4 +1,4 @@
-import { api, fmt, makeSortable, cacheGet, cacheSet } from '/web/app.js';
+import { api, fmt, makeSortable, cacheGet, cacheSet, workspaceLabel, bindWorkspaceTooltips } from '/web/app.js';
 
 const URL = '/api/projects';
 
@@ -21,7 +21,7 @@ function renderProjects(root, rows) {
         <tbody>
           ${rows.map(r => `
             <tr>
-              <td class="blur-sensitive" data-val="${fmt.htmlSafe(r.project_name || r.project_slug)}" title="${fmt.htmlSafe(r.project_slug)}">${fmt.htmlSafe(r.project_name || r.project_slug)}</td>
+              <td class="blur-sensitive" data-val="${fmt.htmlSafe(r.project_name || r.project_slug)}">${workspaceLabel(r.project_name || r.project_slug, r.workspace_path)}</td>
               <td class="num" data-val="${r.sessions || 0}">${fmt.int(r.sessions)}</td>
               <td class="num" data-val="${r.turns || 0}">${fmt.int(r.turns)}</td>
               <td class="num" data-val="${r.billable_tokens || 0}">${fmt.int(r.billable_tokens)}</td>
@@ -31,4 +31,5 @@ function renderProjects(root, rows) {
       </table>
     </div>`;
   makeSortable(root.querySelector('#projects-table'), { col: 3, dir: 'desc' });
+  bindWorkspaceTooltips(root);
 }

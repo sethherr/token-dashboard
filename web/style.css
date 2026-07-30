@@ -417,3 +417,38 @@ hr.divider { border: 0; border-top: 1px solid var(--border); margin: 16px 0; }
   .glossary dl { grid-template-columns: 1fr; gap: 4px 0; }
   .glossary dt { margin-top: 10px; }
 }
+
+/* ── Workspace labels ────────────────────────────────────────────────────────
+   With GitHub PR association on, a workspace's display name no longer says
+   where the work happened, so the path is always reachable: native tooltip on
+   hover (the title attribute) and a click/keyboard-toggled popover for touch
+   and for paths long enough that the OS tooltip truncates them. */
+.ws-label {
+  position: relative;
+  cursor: help;
+  border-bottom: 1px dotted var(--border-2);
+}
+.ws-label:focus-visible {
+  outline: 2px solid var(--accent, #58a6ff);
+  outline-offset: 2px;
+}
+.ws-label.ws-open::after {
+  content: attr(data-ws-path);
+  position: absolute;
+  left: 0;
+  top: calc(100% + 6px);
+  z-index: 40;
+  max-width: min(640px, 80vw);
+  white-space: pre-wrap;
+  word-break: break-all;
+  background: var(--panel-2, #0F1419);
+  color: var(--text, #E6EDF3);
+  border: 1px solid var(--border-2, #283040);
+  border-radius: 6px;
+  padding: 6px 9px;
+  font-family: var(--mono);
+  font-size: 11px;
+  line-height: 1.45;
+  font-weight: 400;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.45);
+}

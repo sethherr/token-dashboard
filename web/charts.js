@@ -169,7 +169,7 @@ export function groupedBarChart(el, { categories, series, formatter }) {
   return c;
 }
 
-export function sankeyChart(el, { nodes, links, formatter }) {
+export function sankeyChart(el, { nodes, links, formatter, nodePaths }) {
   const c = mount(el);
   // Accept nodes as either ['name', ...] or [{name: 'x'}, ...] — the bipartite
   // workspaces matrix returns objects so it can carry layout hints later.
@@ -189,7 +189,11 @@ export function sankeyChart(el, { nodes, links, formatter }) {
         if (p.dataType === 'edge') {
           return `${fmt.htmlSafe(p.data.source)} → ${fmt.htmlSafe(p.data.target)}<br/><b>${v}</b>`;
         }
-        return `<b>${fmt.htmlSafe(p.name)}</b><br/>${v}`;
+        // Workspace nodes show the directory they stand for — with PR labels on,
+        // the node name no longer reveals where the work actually happened.
+        const path = nodePaths && nodePaths[p.name];
+        const where = path ? `<br/><span style="opacity:.7">${fmt.htmlSafe(path)}</span>` : '';
+        return `<b>${fmt.htmlSafe(p.name)}</b><br/>${v}${where}`;
       },
     },
     series: [{

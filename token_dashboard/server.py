@@ -15,8 +15,10 @@ from pathlib import Path
 from typing import Optional, Tuple
 from urllib.parse import urlparse, parse_qs
 
+from . import pr_links
 from .db import (
     clear_scan_data, default_claude_dir, get_setting, set_setting,
+    workspace_pr_map, save_workspace_prs, workspace_root_paths, clear_workspace_prs,
     overview_totals, expensive_prompts, project_summary,
     tool_token_breakdown, recent_sessions, session_turns,
     session_model_tokens,
@@ -116,8 +118,9 @@ def _overview_bundle(db_path: str, since, until, pricing: dict) -> dict:
     totals["cost_usd"] = round(cost_usd, 4)
     return {
         "totals": totals,
-        "projects": project_summary(db_path, since, until),
-        "sessions": recent_sessions(db_path, limit=10, since=since, until=until),
+        "projects": _apply_workspace_labels(db_path, project_summary(db_path, since, until)),
+        "sessions": _apply_workspace_labels(
+            db_path, recent_sessions(db_path, limit=10, since=since, until=until)),
         "tools": tool_token_breakdown(db_path, since, until),
         "daily": daily_token_breakdown(db_path, since, until),
         "byModel": by_model,
@@ -374,6 +377,151 @@ def _validate_claude_dir(raw) -> Tuple[Optional[Path], Optional[str]]:
     return path, None
 
 
+# Budget the expensive thing — the GitHub round-trip — rather than the number
+# of workspaces. Most historical workspaces are deleted worktrees that fail a
+# local `git rev-parse` in milliseconds, so capping total paths would skip
+# live ones to save time we were never going to spend.
+MAX_WORKSPACE_PR_LOOKUPS = 200
+MAX_WORKSPACE_PATHS = 5000  # runaway guard only
+
+
+def _refresh_workspace_prs(db_path: str, paths=None, resolver=None) -> dict:
+    """Resolve every known workspace to its repo/PR and cache the result."""
+    resolver = resolver or pr_links.resolve_workspace
+    paths = list(paths if paths is not None else workspace_root_paths(db_path))
+    truncated = 0
+    if len(paths) > MAX_WORKSPACE_PATHS:
+        truncated = len(paths) - MAX_WORKSPACE_PATHS
+        paths = paths[:MAX_WORKSPACE_PATHS]
+    git_bin = pr_links.find_git()
+    gh_bin = pr_links.find_gh()
+    rows = []
+    lookups = 0
+    throttled = 0
+    for path in paths:
+        allow = lookups < MAX_WORKSPACE_PR_LOOKUPS
+        try:
+            row = resolver(path, git_bin=git_bin, gh_bin=gh_bin, allow_network=allow)
+        except Exception:
+            continue  # one bad workspace shouldn't abort the whole refresh
+        rows.append(row)
+        # Paths ordered busiest-first, so if the budget runs out the workspaces
+        # that lose their PR number are the ones you look at least.
+        if row.get("resolved") and not row.get("is_main") and row.get("branch"):
+            if allow:
+                lookups += 1
+            else:
+                throttled += 1
+    save_workspace_prs(db_path, rows)
+    return {
+        "checked": len(paths),
+        "resolved": sum(1 for r in rows if r.get("resolved")),
+        "with_pr": sum(1 for r in rows if r.get("pr_number")),
+        "pr_lookups": lookups,
+        "throttled": throttled,
+        "skipped": truncated,
+        "gh_available": bool(gh_bin),
+        "git_available": bool(git_bin),
+    }
+
+
+def _apply_workspace_labels(db_path: str, payload, name_keys=("project_name",),
+                            path_key: str = "workspace_path"):
+    """Swap workspace display names for their GitHub PR label, in place.
+
+    A no-op unless the setting is on and the workspace has a cached label, so
+    a workspace whose worktree has been deleted (the usual fate of a merged
+    branch) keeps the directory-derived name it always had.
+
+    ``payload`` may be a row, a list of rows, or a dict of lists; it is
+    returned unchanged so callers can wrap a query result inline.
+    """
+    if not workspace_pr_links_enabled(db_path):
+        return payload
+    labels = workspace_pr_map(db_path)
+    if not labels:
+        return payload
+
+    def decorate(row):
+        if not isinstance(row, dict):
+            return
+        info = labels.get(row.get(path_key))
+        if not info or not info.get("label"):
+            return
+        for key in name_keys:
+            if key in row and row[key]:
+                row.setdefault(f"{key}_original", row[key])
+                row[key] = info["label"]
+        row["pr_number"] = info.get("pr_number")
+        row["pr_title"] = info.get("pr_title")
+        row["pr_url"] = info.get("pr_url")
+        row["pr_state"] = info.get("pr_state")
+        row["repo"] = info.get("repo")
+
+    if isinstance(payload, list):
+        for row in payload:
+            decorate(row)
+    elif isinstance(payload, dict):
+        decorate(payload)
+    return payload
+
+
+def _apply_sankey_labels(db_path: str, matrix: dict) -> dict:
+    """Relabel Sankey node names, keeping the ' (agent)'/' (files)' suffixes.
+
+    Node names are also link endpoints, so both sides have to be rewritten
+    with the same mapping or ECharts drops the links.
+    """
+    if not workspace_pr_links_enabled(db_path) or not isinstance(matrix, dict):
+        return matrix
+    labels = workspace_pr_map(db_path)
+    if not labels:
+        return matrix
+    rename: dict = {}
+    for node in matrix.get("nodes") or []:
+        info = labels.get(node.get("workspace_path"))
+        if not info or not info.get("label"):
+            continue
+        name = node.get("name") or ""
+        for suffix in (" (agent)", " (files)"):
+            if name.endswith(suffix):
+                new = f"{info['label']}{suffix}"
+                break
+        else:
+            new = info["label"]
+        if new != name:
+            rename[name] = new
+            node["name_original"] = name
+            node["name"] = new
+    for link in matrix.get("links") or []:
+        if link.get("source") in rename:
+            link["source"] = rename[link["source"]]
+        if link.get("target") in rename:
+            link["target"] = rename[link["target"]]
+    return matrix
+
+
+WORKSPACE_PR_SETTING = "workspace_pr_links"
+
+
+def workspace_pr_links_enabled(db_path: str) -> bool:
+    """Whether to relabel workspaces with their GitHub PR. Off by default."""
+    return get_setting(db_path, WORKSPACE_PR_SETTING, "0") == "1"
+
+
+def _workspace_pr_status(db_path: str) -> dict:
+    rows = workspace_pr_map(db_path)
+    checked = [r.get("checked_at") for r in rows.values() if r.get("checked_at")]
+    return {
+        "enabled": workspace_pr_links_enabled(db_path),
+        "linked": len(rows),
+        "with_pr": sum(1 for r in rows.values() if r.get("pr_number")),
+        "last_checked": max(checked) if checked else None,
+        "gh_available": bool(pr_links.find_gh()),
+        "git_available": bool(pr_links.find_git()),
+    }
+
+
 def _settings_payload(db_path: str, projects_override: Optional[str] = None) -> dict:
     claude_dir = _claude_dir(db_path)
     projects_dir = _projects_dir(db_path, projects_override)
@@ -382,6 +530,7 @@ def _settings_payload(db_path: str, projects_override: Optional[str] = None) -> 
         "projects_dir": str(projects_dir),
         "projects_overridden": bool(projects_override),
         "claude_dirs": _claude_dirs(db_path),
+        "workspace_prs": _workspace_pr_status(db_path),
     }
 
 
@@ -447,7 +596,7 @@ def build_handler(db_path: str, projects_dir: Optional[str] = None):
                 cached = _cache_get(cache_key)
                 if cached is not None:
                     return _send_json(self, cached)
-                data = project_summary(db_path, since, until)
+                data = _apply_workspace_labels(db_path, project_summary(db_path, since, until))
                 _cache_set(cache_key, data)
                 return _send_json(self, data)
             if path == "/api/tools":
@@ -461,10 +610,10 @@ def build_handler(db_path: str, projects_dir: Optional[str] = None):
                 cached = _cache_get(cache_key)
                 if cached is not None:
                     return _send_json(self, cached)
-                data = recent_sessions(
+                data = _apply_workspace_labels(db_path, recent_sessions(
                     db_path, limit=_clamp_limit(qs.get("limit", ["20"])[0], 20),
                     since=since, until=until,
-                )
+                ))
                 by_model = session_model_tokens(db_path, [s["session_id"] for s in data])
                 for s in data:
                     total = 0.0
@@ -556,7 +705,7 @@ def build_handler(db_path: str, projects_dir: Optional[str] = None):
                 cached = _cache_get(cache_key)
                 if cached is not None:
                     return _send_json(self, cached)
-                data = workspaces_matrix(db_path, since, until)
+                data = _apply_sankey_labels(db_path, workspaces_matrix(db_path, since, until))
                 _cache_set(cache_key, data)
                 return _send_json(self, data)
             if path == "/api/cross-workspace-leaks":
@@ -567,6 +716,9 @@ def build_handler(db_path: str, projects_dir: Optional[str] = None):
                     db_path, limit=_clamp_limit(qs.get("limit", ["20"])[0], 20),
                     since=since, until=until,
                 )
+                # Each leak row names two workspaces, so relabel both sides.
+                _apply_workspace_labels(db_path, data, ("source",), "source_path")
+                _apply_workspace_labels(db_path, data, ("target",), "target_path")
                 _cache_set(cache_key, data)
                 return _send_json(self, data)
             if path == "/api/subagents":
@@ -578,11 +730,12 @@ def build_handler(db_path: str, projects_dir: Optional[str] = None):
                     c = cost_for(r["model"], r, pricing)
                     r["cost_usd"] = c["usd"]
                     r["cost_estimated"] = c["estimated"]
-                top = top_subagent_sessions(
+                top = _apply_workspace_labels(db_path, top_subagent_sessions(
                     db_path, limit=_clamp_limit(qs.get("limit", ["20"])[0], 20),
                     since=since, until=until,
-                )
+                ))
                 orch = orchestration_breakdown(db_path, since, until)
+                _apply_workspace_labels(db_path, orch.get("sdk_runs") or [], ("workspace",))
                 for bucket in ("by_kind", "by_entrypoint"):
                     for r in orch[bucket]:
                         c = cost_for(r["model"], r, pricing)
@@ -703,6 +856,23 @@ def build_handler(db_path: str, projects_dir: Optional[str] = None):
                                 clear_scan_data(db_path)
                     _cache_clear()
                     return _send_json(self, {"ok": True, **_settings_payload(db_path, projects_dir)})
+                if url.path == "/api/workspace-prs":
+                    enabled = bool(body.get("enabled"))
+                    set_setting(db_path, WORKSPACE_PR_SETTING, "1" if enabled else "0")
+                    if not enabled and body.get("clear"):
+                        clear_workspace_prs(db_path)
+                    _cache_clear()  # cached payloads carry the old labels
+                    result = {"ok": True}
+                    if enabled and body.get("refresh", True):
+                        result.update(_refresh_workspace_prs(db_path))
+                    return _send_json(self, {**result, "workspace_prs": _workspace_pr_status(db_path)})
+                if url.path == "/api/workspace-prs/refresh":
+                    if not workspace_pr_links_enabled(db_path):
+                        return _send_error(self, 400, "workspace PR links are turned off")
+                    result = _refresh_workspace_prs(db_path)
+                    _cache_clear()
+                    return _send_json(self, {"ok": True, **result,
+                                             "workspace_prs": _workspace_pr_status(db_path)})
                 if url.path == "/api/tips/dismiss":
                     dismiss_tip(db_path, body.get("key", ""))
                     _cache_clear()

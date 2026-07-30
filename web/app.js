@@ -92,6 +92,47 @@ export function cacheGet(key) {
 export function cacheSet(key, data) { _cache.set(key, { data, ts: Date.now() }); }
 export function cacheClear()        { _cache.clear(); }
 
+// ── Workspace labels ──────────────────────────────────────────────────────────
+// A workspace is a directory an agent ran in. With PR association on, the
+// server rewrites the display name to "{repo}: PR #N - title", which hides
+// where the work actually happened — so the path is always available as a
+// tooltip, on hover and on click.
+
+/** Inner HTML for a workspace name plus its path tooltip. */
+export function workspaceLabel(name, path, { className = '' } = {}) {
+  const label = fmt.htmlSafe(name ?? '');
+  if (!path) return className ? `<span class="${className}">${label}</span>` : label;
+  const safePath = fmt.htmlSafe(path);
+  return `<span class="ws-label ${className}" tabindex="0" role="button"
+    aria-label="${label} — ${safePath}" title="${safePath}"
+    data-ws-path="${safePath}">${label}</span>`;
+}
+
+/** Click-to-reveal for workspace paths. Hover is handled by the title attribute. */
+export function bindWorkspaceTooltips(root = document) {
+  root.querySelectorAll('.ws-label[data-ws-path]').forEach(el => {
+    if (el.dataset.wsBound) return;
+    el.dataset.wsBound = '1';
+    const toggle = e => {
+      e.stopPropagation();
+      const open = el.classList.contains('ws-open');
+      root.querySelectorAll('.ws-label.ws-open').forEach(o => o.classList.remove('ws-open'));
+      if (!open) el.classList.add('ws-open');
+    };
+    el.addEventListener('click', toggle);
+    el.addEventListener('keydown', e => {
+      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(e); }
+      if (e.key === 'Escape') el.classList.remove('ws-open');
+    });
+  });
+  if (!document.body.dataset.wsDismissBound) {
+    document.body.dataset.wsDismissBound = '1';
+    document.addEventListener('click', () => {
+      document.querySelectorAll('.ws-label.ws-open').forEach(o => o.classList.remove('ws-open'));
+    });
+  }
+}
+
 // ── Refresh / countdown state ─────────────────────────────────────────────────
 const SCAN_INTERVAL = 60_000; // must match server _scan_loop interval
 let _nextScanAt  = Date.now() + SCAN_INTERVAL;

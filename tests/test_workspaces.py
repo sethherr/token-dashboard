@@ -52,29 +52,35 @@ class WorkspaceRootTests(unittest.TestCase):
 
 
 class ClassifyPathTests(unittest.TestCase):
+    # Index entries are (normalised_prefix, display_name, original_root_path).
+    # The root comes back alongside the name so the UI can show the workspace
+    # path in a tooltip and look up its GitHub PR association.
     def setUp(self):
         self.index = [
-            (r"c:\users\a\projects\longer-project", "Longer"),
-            (r"c:\users\a\projects\proj", "Proj"),
+            (r"c:\users\a\projects\longer-project", "Longer", r"C:\Users\a\projects\longer-project"),
+            (r"c:\users\a\projects\proj", "Proj", r"C:\Users\a\projects\proj"),
         ]
 
     def test_matches_longest_prefix_first(self):
         self.assertEqual(
             _classify_path(r"C:\Users\a\projects\longer-project\src\x.py", self.index),
-            "Longer",
+            ("Longer", r"C:\Users\a\projects\longer-project"),
         )
 
     def test_exact_root_match(self):
         self.assertEqual(
             _classify_path(r"c:\users\a\projects\proj", self.index),
-            "Proj",
+            ("Proj", r"C:\Users\a\projects\proj"),
         )
 
     def test_unknown_path_is_external(self):
-        self.assertEqual(_classify_path(r"C:\Windows\System32\drivers\etc\hosts", self.index), "external")
+        self.assertEqual(
+            _classify_path(r"C:\Windows\System32\drivers\etc\hosts", self.index),
+            ("external", None),
+        )
 
     def test_none_path_is_external(self):
-        self.assertEqual(_classify_path(None, self.index), "external")
+        self.assertEqual(_classify_path(None, self.index), ("external", None))
 
 
 class WorkspacesMatrixTests(unittest.TestCase):

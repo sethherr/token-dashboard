@@ -152,6 +152,24 @@ CREATE TABLE IF NOT EXISTS summary_sessions (
 );
 CREATE INDEX IF NOT EXISTS idx_summary_sessions_ended ON summary_sessions(ended);
 CREATE INDEX IF NOT EXISTS idx_summary_sessions_project ON summary_sessions(project_slug);
+
+-- Workspace -> GitHub PR association, populated only when the
+-- workspace_pr_links setting is on. Cached so rendering a page never
+-- shells out to git/gh; refreshed explicitly from Settings.
+CREATE TABLE IF NOT EXISTS workspace_prs (
+  path        TEXT PRIMARY KEY,
+  repo        TEXT,
+  repo_slug   TEXT,
+  branch      TEXT,
+  is_main     INTEGER NOT NULL DEFAULT 0,
+  pr_number   INTEGER,
+  pr_title    TEXT,
+  pr_url      TEXT,
+  pr_state    TEXT,
+  label       TEXT,
+  resolved    INTEGER NOT NULL DEFAULT 0,
+  checked_at  REAL
+);
 """
 
 
@@ -544,6 +562,97 @@ def best_project_name(cwds, slug: str) -> str:
     return project_name_for(cwds[0] if cwds else None, slug)
 
 
+def _decorate_workspace(r: dict) -> None:
+    """Attach ``project_name`` + ``workspace_path`` from a row's ``sample_cwd``.
+
+    ``workspace_path`` is what the UI shows in the hover/click tooltip, and
+    the key the workspace→PR association is stored under. It's the workspace
+    *root* (the ancestor whose slug-encoding matches), not the deeper cwd a
+    session happened to start in, so every row for one worktree agrees.
+    """
+    cwd = r.pop("sample_cwd", None)
+    slug = r.get("project_slug") or ""
+    r["project_name"] = project_name_for(cwd, slug)
+    r["workspace_path"] = _workspace_root_path(cwd or "", slug) or cwd
+
+
+def _slug_workspace(conn, slug: str, cache: dict) -> tuple:
+    """(display_name, workspace_root_path) for a project slug, memoised."""
+    if slug not in cache:
+        cwds = [r["cwd"] for r in conn.execute(
+            "SELECT DISTINCT cwd FROM messages WHERE project_slug=? AND cwd IS NOT NULL",
+            (slug,),
+        )]
+        root = None
+        for cwd in cwds:
+            root = _workspace_root_path(cwd, slug)
+            if root:
+                break
+        cache[slug] = (best_project_name(cwds, slug), root or (cwds[0] if cwds else None))
+    return cache[slug]
+
+
+def workspace_root_paths(db_path) -> list:
+    """Every distinct workspace root path in the DB, busiest first.
+
+    These are the paths the PR association is resolved for.
+    """
+    counts: dict = {}
+    with connect(db_path) as c:
+        for r in c.execute(
+            "SELECT cwd, project_slug, COUNT(*) AS n FROM messages "
+            "WHERE cwd IS NOT NULL AND project_slug IS NOT NULL "
+            "GROUP BY cwd, project_slug"
+        ):
+            root = _workspace_root_path(r["cwd"], r["project_slug"]) or r["cwd"]
+            if root:
+                counts[root] = counts.get(root, 0) + r["n"]
+    return [p for p, _ in sorted(counts.items(), key=lambda kv: -kv[1])]
+
+
+_WORKSPACE_PR_COLS = (
+    "path", "repo", "repo_slug", "branch", "is_main",
+    "pr_number", "pr_title", "pr_url", "pr_state", "label", "resolved", "checked_at",
+)
+
+
+def save_workspace_prs(db_path, rows) -> int:
+    """Upsert resolved workspace→PR rows. Returns the number written."""
+    rows = [r for r in (rows or []) if r and r.get("path")]
+    if not rows:
+        return 0
+    cols = ",".join(_WORKSPACE_PR_COLS)
+    placeholders = ",".join(f":{c}" for c in _WORKSPACE_PR_COLS)
+    with connect(db_path) as c:
+        c.executemany(
+            f"INSERT OR REPLACE INTO workspace_prs ({cols}) VALUES ({placeholders})",
+            [{k: r.get(k) for k in _WORKSPACE_PR_COLS} for r in rows],
+        )
+        c.commit()
+    return len(rows)
+
+
+def workspace_pr_map(db_path) -> dict:
+    """``{workspace_path: row}`` for every workspace with a resolved label."""
+    out: dict = {}
+    with connect(db_path) as c:
+        try:
+            cur = c.execute(
+                "SELECT * FROM workspace_prs WHERE label IS NOT NULL AND label != ''"
+            )
+        except sqlite3.OperationalError:
+            return out  # table predates this feature; nothing cached yet
+        for r in cur:
+            out[r["path"]] = dict(r)
+    return out
+
+
+def clear_workspace_prs(db_path) -> None:
+    with connect(db_path) as c:
+        c.execute("DELETE FROM workspace_prs")
+        c.commit()
+
+
 def overview_totals(db_path, since=None, until=None) -> dict:
     rng, args = _range_clause(since, until)
     sql = f"""
@@ -680,11 +789,11 @@ def project_summary(db_path, since=None, until=None) -> list:
                ORDER BY billable_tokens DESC
             """, (*sess_args, *day_args))]
             for r in rows:
-                r["project_name"] = project_name_for(r.pop("sample_cwd", None), r["project_slug"])
+                _decorate_workspace(r)
             return rows
         rows = [dict(r) for r in c.execute(sql, args)]
         for r in rows:
-            r["project_name"] = project_name_for(r.pop("sample_cwd", None), r["project_slug"])
+            _decorate_workspace(r)
     return rows
 
 
@@ -741,11 +850,11 @@ def recent_sessions(db_path, limit: int = 20, since=None, until=None) -> list:
                LIMIT ?
             """, (*sess_args, limit))]
             for r in rows:
-                r["project_name"] = project_name_for(r.pop("sample_cwd", None), r["project_slug"])
+                _decorate_workspace(r)
             return rows
         rows = [dict(r) for r in c.execute(sql, (*args, limit))]
         for r in rows:
-            r["project_name"] = project_name_for(r.pop("sample_cwd", None), r["project_slug"])
+            _decorate_workspace(r)
     return rows
 
 
@@ -990,25 +1099,29 @@ def _build_workspace_index(conn) -> list:
         for root in roots:
             norm = _normalize_path(root)
             if norm:
-                candidates.append((norm, name))
+                candidates.append((norm, name, root))
     candidates.sort(key=lambda x: -len(x[0]))
-    for prefix, name in candidates:
+    for prefix, name, root in candidates:
         if prefix in seen:
             continue
         seen.add(prefix)
-        out.append((prefix, name))
+        out.append((prefix, name, root))
     return out
 
 
-def _classify_path(path: str, index: list) -> str:
-    """Return workspace name for a path, or 'external' when no prefix matches."""
+def _classify_path(path: str, index: list) -> tuple:
+    """(workspace_name, workspace_root_path) for a path.
+
+    Returns ('external', None) when no workspace prefix matches — the file
+    lives outside every directory we've seen an agent working in.
+    """
     if not path:
-        return "external"
+        return "external", None
     norm = _normalize_path(path)
-    for prefix, name in index:
+    for prefix, name, root in index:
         if norm == prefix or norm.startswith(prefix + "\\"):
-            return name
-    return "external"
+            return name, root
+    return "external", None
 
 
 _CROSS_WS_TOOLS = ("Read", "Edit", "Write", "NotebookEdit")
@@ -1044,9 +1157,11 @@ def workspaces_matrix(db_path, since=None, until=None) -> dict:
     cross_calls = 0
     with connect(db_path) as c:
         index = _build_workspace_index(c)
+        node_paths: dict = {}
         for row in c.execute(sql, (*_CROSS_WS_TOOLS, *args)):
             src = project_name_for(row["src_cwd"], row["src_slug"]) or row["src_slug"] or "unknown"
-            dst = _classify_path(row["target"], index)
+            src_path = _workspace_root_path(row["src_cwd"] or "", row["src_slug"] or "") or row["src_cwd"]
+            dst, dst_path = _classify_path(row["target"], index)
             n = row["n"]
             if src == dst:
                 self_loop_calls += n
@@ -1055,10 +1170,13 @@ def workspaces_matrix(db_path, since=None, until=None) -> dict:
             src_label = f"{src} (agent)"
             dst_label = f"{dst} (files)"
             src_nodes.add(src_label); dst_nodes.add(dst_label)
+            node_paths.setdefault(src_label, src_path)
+            node_paths.setdefault(dst_label, dst_path)
             key = (src_label, dst_label)
             matrix[key] = matrix.get(key, 0) + n
     return {
-        "nodes": [{"name": n} for n in sorted(src_nodes) + sorted(dst_nodes)],
+        "nodes": [{"name": n, "workspace_path": node_paths.get(n)}
+                  for n in sorted(src_nodes) + sorted(dst_nodes)],
         "links": [{"source": s, "target": t, "value": v} for (s, t), v in matrix.items()],
         "total_calls": sum(matrix.values()),
         "self_loop_calls": self_loop_calls,
@@ -1087,11 +1205,14 @@ def cross_workspace_leaks(db_path, limit: int = 20, since=None, until=None) -> l
     pair: dict = {}
     with connect(db_path) as c:
         index = _build_workspace_index(c)
+        paths: dict = {}
         for row in c.execute(sql, (*_CROSS_WS_TOOLS, *args)):
             src = project_name_for(row["src_cwd"], row["src_slug"]) or row["src_slug"] or "unknown"
-            dst = _classify_path(row["target"], index)
+            dst, dst_path = _classify_path(row["target"], index)
             if src == dst:
                 continue
+            paths.setdefault(src, _workspace_root_path(row["src_cwd"] or "", row["src_slug"] or "") or row["src_cwd"])
+            paths.setdefault(dst, dst_path)
             key = (src, dst)
             pd = pair.setdefault(key, {"calls": 0, "sessions": set(), "files": {}})
             pd["calls"] += row["n"]
@@ -1103,6 +1224,8 @@ def cross_workspace_leaks(db_path, limit: int = 20, since=None, until=None) -> l
         out.append({
             "source": src,
             "target": dst,
+            "source_path": paths.get(src),
+            "target_path": paths.get(dst),
             "calls": pd["calls"],
             "sessions": len(pd["sessions"]),
             "top_files": [{"path": p, "n": n} for p, n in top_files],
@@ -1214,13 +1337,7 @@ def dispatch_tree(db_path, limit: int = 100, since=None, until=None) -> list:
         slug_cache: dict = {}
         for r in rows:
             slug = r["project_slug"]
-            if slug not in slug_cache:
-                cwds = [r2["cwd"] for r2 in c.execute(
-                    "SELECT DISTINCT cwd FROM messages WHERE project_slug=? AND cwd IS NOT NULL",
-                    (slug,),
-                )]
-                slug_cache[slug] = best_project_name(cwds, slug)
-            r["project_name"] = slug_cache[slug]
+            r["project_name"], r["workspace_path"] = _slug_workspace(c, slug, slug_cache)
             r["models"] = sorted((r["models"] or "").split(",")) if r["models"] else []
     return rows
 
@@ -1302,13 +1419,7 @@ def orchestration_breakdown(db_path, since=None, until=None) -> dict:
         for row in c.execute(sdk_runs_sql, args):
             d = dict(row)
             slug = d["project_slug"]
-            if slug not in slug_cache:
-                cwds = [r2["cwd"] for r2 in c.execute(
-                    "SELECT DISTINCT cwd FROM messages WHERE project_slug=? AND cwd IS NOT NULL",
-                    (slug,),
-                )]
-                slug_cache[slug] = best_project_name(cwds, slug)
-            d["workspace"] = slug_cache[slug]
+            d["workspace"], d["workspace_path"] = _slug_workspace(c, slug, slug_cache)
             d["models"] = sorted((d["models"] or "").split(",")) if d["models"] else []
             sdk_runs.append(d)
     return {
@@ -1340,12 +1451,6 @@ def top_subagent_sessions(db_path, limit: int = 20, since=None, until=None) -> l
         slug_cache: dict = {}
         for r in rows:
             slug = r["project_slug"]
-            if slug not in slug_cache:
-                cwds = [row["cwd"] for row in c.execute(
-                    "SELECT DISTINCT cwd FROM messages WHERE project_slug=? AND cwd IS NOT NULL",
-                    (slug,),
-                )]
-                slug_cache[slug] = best_project_name(cwds, slug)
-            r["project_name"] = slug_cache[slug]
+            r["project_name"], r["workspace_path"] = _slug_workspace(c, slug, slug_cache)
             r["models"] = sorted((r["models"] or "").split(",")) if r["models"] else []
     return rows

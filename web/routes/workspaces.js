@@ -1,4 +1,4 @@
-import { api, fmt } from '/web/app.js';
+import { api, fmt, workspaceLabel, bindWorkspaceTooltips } from '/web/app.js';
 import { sankeyChart } from '/web/charts.js';
 
 const RANGES = [
@@ -88,9 +88,9 @@ export default async function (root) {
         <tbody>
           ${leaks.length === 0 ? '<tr><td colspan="6" class="muted">no cross-workspace activity in this range</td></tr>' : leaks.map(l => `
             <tr>
-              <td><span class="badge blur-sensitive">${fmt.htmlSafe(l.source)}</span></td>
+              <td>${workspaceLabel(l.source, l.source_path, { className: 'badge blur-sensitive' })}</td>
               <td class="muted">→</td>
-              <td><span class="badge blur-sensitive">${fmt.htmlSafe(l.target)}</span></td>
+              <td>${workspaceLabel(l.target, l.target_path, { className: 'badge blur-sensitive' })}</td>
               <td class="num">${fmt.int(l.calls)}</td>
               <td class="num">${fmt.int(l.sessions)}</td>
               <td class="mono" style="font-size:11px">
@@ -105,12 +105,16 @@ export default async function (root) {
   root.querySelectorAll('.range-tabs button').forEach(btn => {
     btn.addEventListener('click', () => writeRange(btn.dataset.range));
   });
+  bindWorkspaceTooltips(root);
 
   if (matrix.links.length > 0) {
+    const nodePaths = Object.fromEntries(
+      (matrix.nodes || []).filter(n => n.workspace_path).map(n => [n.name, n.workspace_path]));
     sankeyChart(document.getElementById('ch-workspaces'), {
       nodes: matrix.nodes,
       links: matrix.links,
       formatter: v => Number(v).toLocaleString() + ' calls',
+      nodePaths,
     });
   } else {
     document.getElementById('ch-workspaces').innerHTML = '<p class="muted" style="padding:40px;text-align:center">No file-touching activity in this range.</p>';

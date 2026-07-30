@@ -42,3 +42,26 @@ The first `python3 cli.py scan` on a heavy user's machine can read tens of MB ac
 ## Running two dashboards against the same DB
 
 Both will fight over the SQLite file and you'll see inconsistent numbers and occasional `database is locked` errors. Only run one at a time. If you want to view the dashboard from a second device, use `HOST=0.0.0.0` on the one running machine and point the second device's browser at it.
+
+## Workspace PR association only covers worktrees that still exist
+
+The optional *associate workspaces with GitHub PRs* setting resolves a workspace
+by running `git` inside its directory. A worktree that has been deleted — the
+normal fate of a branch once it merges — can't report its branch, so there's
+nothing to match a PR against. Those workspaces keep their directory-derived
+name, which is the honest answer: the association is unknown, not absent.
+
+The practical effect on a long transcript history is that most historical
+workspaces stay unlabelled and recent, still-checked-out ones get PR titles.
+Nothing is lost — labels only ever replace a directory name that is still shown
+in the hover/click tooltip.
+
+Two smaller bounds:
+
+- PR lookups hit the network, so a refresh resolves at most 200 of them
+  (workspaces are processed busiest-first; the rest still get
+  `{repo}: {branch}` from the local checkout). The response reports how many
+  were throttled.
+- Association is a point-in-time snapshot, refreshed only when you press
+  **Refresh PR links** or toggle the setting on. A PR retitled after that shows
+  its old title until the next refresh.

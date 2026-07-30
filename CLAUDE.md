@@ -29,11 +29,12 @@ Claude Code writes one JSONL file per session to `~/.claude/projects/<project-sl
 - **Stdlib only.** No `pip install`. If a new feature needs a third-party library, argue for it first — we're willing to pay ergonomics cost to keep install friction at zero.
 - **SQLite parameter binding always.** Any f-string in a SQL statement must interpolate only internal, caller-controlled values (column names, placeholder lists). User-reachable values go through `?`.
 - **Small files with clear responsibilities.** Prefer one concern per module. Once a file passes ~500 lines or starts accreting unrelated concerns, ask whether it's time to split — `db.py` and `server.py` are the current outliers and OK as-is.
+- **Workspace labels go through one path.** A workspace is identified by its root path (`workspace_path` on API rows). Any new endpoint that shows a workspace name must carry that path and run through `server._apply_workspace_labels`, or the optional PR relabelling will silently skip it. On the frontend use `workspaceLabel()` + `bindWorkspaceTooltips()` from `web/app.js` so the path tooltip comes along.
 - **Streaming-snapshot dedup.** When adding scanner logic that joins the `messages` table, remember `(session_id, message_id)` is the dedup key, not `uuid`. See `scanner._evict_prior_snapshots_bulk` and the migration note in `db._migrate_add_message_id`.
 
 ## Customizing
 
-Env vars: `PORT` (default 8080), `HOST` (default 127.0.0.1), `CLAUDE_PROJECTS_DIR`, `TOKEN_DASHBOARD_DB`, `TOKEN_DASHBOARD_RTK_BIN`. The UI can persist a `.claude` folder fallback for scans. Pricing lives in `pricing.json`. See README.md § Environment variables for details.
+Env vars: `PORT` (default 8080), `HOST` (default 127.0.0.1), `CLAUDE_PROJECTS_DIR`, `TOKEN_DASHBOARD_DB`, `TOKEN_DASHBOARD_RTK_BIN`, `TOKEN_DASHBOARD_GIT_BIN`, `TOKEN_DASHBOARD_GH_BIN`. The UI can persist a `.claude` folder fallback for scans. Pricing lives in `pricing.json`. See README.md § Environment variables for details.
 
 ## Known limitations
 
