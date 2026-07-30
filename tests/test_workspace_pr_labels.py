@@ -5,7 +5,8 @@ import tempfile
 import unittest
 
 from token_dashboard import server
-from token_dashboard.db import init_db, save_workspace_prs, get_setting, set_setting
+from token_dashboard.db import (init_db, save_workspace_prs, get_setting, set_setting,
+                                workspace_pr_map)
 
 
 class LabelApplicationTests(unittest.TestCase):
@@ -570,3 +571,79 @@ class SankeyMergeTests(unittest.TestCase):
         out = server._apply_sankey_labels(self.db, self._matrix())
         for link in out["links"]:
             self.assertNotEqual(link["source"], link["target"])
+
+
+class TopUpMustNotDegradeTests(unittest.TestCase):
+    """An incremental top-up sees only a few paths; it must not lose attribution.
+
+    Regression: the scan-loop top-up resolved a subset of workspaces, so
+    sibling inference had no live sibling to learn from, concluded the repo
+    was unknown, and wrote an empty label over a good one — silently
+    un-labelling workspaces on every scan.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.db = os.path.join(self.tmp, "w.db")
+        init_db(self.db)
+        set_setting(self.db, server.WORKSPACE_PR_SETTING, "1")
+        from token_dashboard.db import connect
+        with connect(self.db) as c:
+            for i, cwd in enumerate(["/ws/repo/alive", "/ws/repo/dead"]):
+                c.execute(
+                    "INSERT INTO messages (uuid, session_id, project_slug, cwd, git_branch, "
+                    "type, timestamp) VALUES (?,?,?,?,?,?,?)",
+                    (f"m{i}", f"s{i}", f"-ws-repo-{cwd.split('/')[-1]}", cwd,
+                     f"feature/{i}", "user", "2026-05-01T00:00:00Z"),
+                )
+            c.commit()
+        # A previous full pass resolved both; the dead one only via inference.
+        save_workspace_prs(self.db, [
+            {"path": "/ws/repo/alive", "repo": "widgets", "repo_slug": "acme/widgets",
+             "branch": "feature/0", "is_main": 0, "pr_number": 1, "pr_title": "One",
+             "pr_url": "u", "pr_state": "OPEN", "label": "widgets: #1 - One",
+             "resolved": 1, "inferred": 0, "checked_at": 1.0},
+            {"path": "/ws/repo/dead", "repo": "widgets", "repo_slug": "acme/widgets",
+             "branch": "feature/1", "is_main": 0, "pr_number": None, "pr_title": None,
+             "pr_url": None, "pr_state": None, "label": "widgets: feature/1",
+             "resolved": 1, "inferred": 1, "checked_at": 1.0},
+        ])
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_existing_label_survives_a_failed_re_resolution(self):
+        def resolver(paths, **kw):
+            rows = [{"path": p, "repo": None, "repo_slug": None, "branch": None,
+                     "is_main": 0, "pr_number": None, "pr_title": None, "pr_url": None,
+                     "pr_state": None, "label": None, "resolved": 0, "inferred": 0,
+                     "checked_at": 2.0} for p in paths]
+            return rows, {"checked": len(paths), "resolved": 0, "with_pr": 0}
+
+        out = server._top_up_workspace_prs(self.db, resolver=resolver, now=1e9)
+        self.assertGreaterEqual(out["kept_existing"], 1)
+        labels = workspace_pr_map(self.db)
+        self.assertEqual(labels["/ws/repo/dead"]["label"], "widgets: feature/1")
+
+    def test_repo_hints_are_passed_so_inference_still_works(self):
+        seen = {}
+
+        def resolver(paths, repo_hints=None, **kw):
+            seen['hints'] = repo_hints or {}
+            return [], {"checked": 0, "resolved": 0, "with_pr": 0}
+
+        server._top_up_workspace_prs(self.db, resolver=resolver, now=1e9)
+        # Both known workspaces live under /ws/repo and agree on the repo.
+        self.assertEqual(seen['hints'].get('/ws/repo'), 'acme/widgets')
+
+    def test_a_real_improvement_is_still_written(self):
+        def resolver(paths, **kw):
+            rows = [{"path": p, "repo": "widgets", "repo_slug": "acme/widgets",
+                     "branch": "feature/1", "is_main": 0, "pr_number": 42,
+                     "pr_title": "Now merged", "pr_url": "u", "pr_state": "MERGED",
+                     "label": "widgets: #42 - Now merged", "resolved": 1,
+                     "inferred": 1, "checked_at": 2.0} for p in paths]
+            return rows, {"checked": len(paths), "resolved": len(paths), "with_pr": len(paths)}
+
+        server._top_up_workspace_prs(self.db, resolver=resolver, now=1e9)
+        self.assertEqual(workspace_pr_map(self.db)["/ws/repo/dead"]["pr_number"], 42)

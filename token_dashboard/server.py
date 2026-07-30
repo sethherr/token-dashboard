@@ -440,6 +440,12 @@ def _top_up_workspace_prs(db_path: str, resolver=None, now=None) -> dict:
         return {"checked": 0}
     capped = paths[:MAX_INCREMENTAL_PR_LOOKUPS]
     resolver = resolver or pr_links.resolve_all
+    # Carry forward what earlier passes learned: this run sees only a handful
+    # of (usually deleted) workspaces, so it has no live sibling to infer a
+    # repo from and would otherwise "resolve" them to nothing.
+    known = workspace_pr_map(db_path)
+    hints = pr_links.infer_repos_by_sibling(
+        {path: row.get("repo_slug") for path, row in known.items()})
     try:
         rows, stats = resolver(
             capped,
@@ -447,11 +453,21 @@ def _top_up_workspace_prs(db_path: str, resolver=None, now=None) -> dict:
             git_bin=pr_links.find_git(), gh_bin=pr_links.find_gh(),
             bulk_limit=0,  # a handful of paths: query branches, don't page whole repos
             max_lookups=MAX_INCREMENTAL_PR_LOOKUPS,
+            repo_hints=hints,
         )
     except Exception as e:
         return {"checked": 0, "error": str(e)}
-    save_workspace_prs(db_path, rows)
-    return {**stats, "pending": max(0, len(paths) - len(capped))}
+    # A top-up may only improve on what is stored. Writing an empty result over
+    # a good label would quietly erase attribution on every scan.
+    keep, downgraded = [], 0
+    for row in rows:
+        if row.get("label") or not (known.get(row.get("path")) or {}).get("label"):
+            keep.append(row)
+        else:
+            downgraded += 1
+    save_workspace_prs(db_path, keep)
+    return {**stats, "pending": max(0, len(paths) - len(capped)),
+            "kept_existing": downgraded}
 
 
 # One refresh at a time: it's a long network job, and two concurrent passes

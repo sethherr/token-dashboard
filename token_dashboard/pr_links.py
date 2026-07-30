@@ -378,7 +378,8 @@ def _row(path, repo_slug_=None, branch=None, is_main=False, pr=None,
 def resolve_all(paths, recorded_branches=None, git_bin=_AUTO, gh_bin=_AUTO,
                 runner: Callable = _run, bulk_limit: int = DEFAULT_PR_FETCH,
                 max_lookups: int = 200, max_searches: int = 100,
-                on_progress: Optional[Callable] = None) -> Tuple[List[dict], dict]:
+                on_progress: Optional[Callable] = None,
+                repo_hints=None) -> Tuple[List[dict], dict]:
     """Resolve every workspace path, including ones no longer on disk.
 
     Four phases, cheapest first:
@@ -396,6 +397,12 @@ def resolve_all(paths, recorded_branches=None, git_bin=_AUTO, gh_bin=_AUTO,
     ``bulk_limit=0`` skips phase 3 entirely — right for incremental top-ups of
     a handful of workspaces, where fetching a repo's whole PR list would cost
     far more than querying each branch.
+
+    ``repo_hints`` seeds phase 2 with ``{parent_dir: repo_slug}`` learned
+    elsewhere. It matters when resolving a *subset* of workspaces: sibling
+    inference can only see the paths it is given, so an incremental pass over
+    a few dead worktrees would otherwise find no live sibling and conclude the
+    repo is unknown — discarding an attribution an earlier full pass made.
 
     ``on_progress``, if given, is called with
     ``{"phase", "done", "total", "detail"}`` as work proceeds — a full refresh
@@ -427,7 +434,9 @@ def resolve_all(paths, recorded_branches=None, git_bin=_AUTO, gh_bin=_AUTO,
         progress("inspect", i, len(paths), path)
 
     # ── 2. inference for the rest ────────────────────────────────────────────
-    sibling_repo = infer_repos_by_sibling({p: i.get("repo_slug") for p, i in live.items()})
+    # Locally observed siblings win over hints: they reflect the disk right now.
+    sibling_repo = dict(repo_hints or {})
+    sibling_repo.update(infer_repos_by_sibling({p: i.get("repo_slug") for p, i in live.items()}))
     plan: dict = {}
     for path in paths:
         info = live.get(path)

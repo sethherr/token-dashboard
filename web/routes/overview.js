@@ -1,5 +1,6 @@
 import { api, fmt, state, cacheGet, cacheSet, workspaceLabel, bindWorkspaceTooltips } from '/web/app.js';
 import { barChart, donutChart, groupedBarChart, stackedBarChart } from '/web/charts.js';
+import { BY_REPO, BY_PROJECT, applyGrouping, hasRepos, readGroup, groupToggle, bindGroupToggle } from '/web/grouping.js';
 
 const RANGES = [
   { key: '1d',  label: '1d',  days: 1 },
@@ -18,11 +19,19 @@ function readRange() {
   return RANGES.find(r => r.key === k) || RANGES.find(r => r.key === '30d');
 }
 
-function writeRange(key) {
-  // Hardcoded base, not re-extracted from the current hash — matches
-  // workspaces.js/subagents.js after the code-review audit.
-  location.hash = '#/overview?range=' + encodeURIComponent(key);
+// Hardcoded base, not re-extracted from the current hash — matches
+// workspaces.js/subagents.js after the code-review audit. Range and grouping
+// share the query string, so each writer carries the other's value forward.
+function writeHash({ range, group }) {
+  const p = new URLSearchParams();
+  p.set('range', range);
+  if (group !== DEFAULT_GROUP) p.set('group', group);
+  location.hash = '#/overview?' + p.toString();
 }
+
+// The dashboard chart leads with repositories: one repo's work is spread over
+// many per-PR workspaces, so the per-workspace view buries the comparison.
+const DEFAULT_GROUP = BY_REPO;
 
 function sinceIso(range) {
   if (!range.days) return null;
@@ -36,6 +45,7 @@ function withSince(url, since) {
 
 export default async function (root) {
   const range = readRange();
+  const group = readGroup(DEFAULT_GROUP);
   const since = sinceIso(range);
   const url   = withSince('/api/overview-bundle', since);
 
@@ -45,13 +55,18 @@ export default async function (root) {
   // with 4 cold-cache bundle queries simultaneously. Server's own warming
   // threads cover this without piling on from the client.
   const cached = cacheGet(url);
-  if (cached) { renderBundle(root, cached, range); return; }
+  if (cached) { renderBundle(root, cached, range, group); return; }
   const fresh = await api(url);
   cacheSet(url, fresh);
-  renderBundle(root, fresh, range);
+  renderBundle(root, fresh, range, group);
 }
 
-function renderBundle(root, { totals, projects, sessions, tools, daily, byModel }, range) {
+function renderBundle(root, { totals, projects, sessions, tools, daily, byModel }, range, group) {
+  // Without the workspace→PR association every row would land in one bucket,
+  // so the repo view (and its toggle) only appear once repos are known.
+  const repoViewAvailable = hasRepos(projects);
+  const groupMode = repoViewAvailable ? group : BY_PROJECT;
+  const chartRows = applyGrouping(projects, groupMode);
   const cacheCreate =
     (totals.cache_create_5m_tokens || 0) +
     (totals.cache_create_1h_tokens || 0);
@@ -116,7 +131,14 @@ function renderBundle(root, { totals, projects, sessions, tools, daily, byModel 
     </div>
 
     <div class="row cols-2" style="margin-top:16px">
-      <div class="card"><h3>Tokens by project</h3><div id="ch-projects" class="blur-sensitive" style="height:320px"></div></div>
+      <div class="card">
+        <div class="flex" style="align-items:baseline;gap:10px;margin-bottom:4px">
+          <h3 style="margin:0">Tokens by ${groupMode === BY_REPO ? 'repository' : 'project'}</h3>
+          <span class="spacer"></span>
+          ${repoViewAvailable ? groupToggle(groupMode, 'ov-group') : ''}
+        </div>
+        <div id="ch-projects" class="blur-sensitive" style="height:320px"></div>
+      </div>
       <div class="card blur-sensitive">
         <h3>Token usage by model</h3>
         <p class="muted" style="margin:-4px 0 4px;font-size:12px">Share of billable tokens per Claude model.</p>
@@ -143,8 +165,10 @@ function renderBundle(root, { totals, projects, sessions, tools, daily, byModel 
     </div>
   `;
 
-  root.querySelectorAll('.range-tabs button').forEach(btn => {
-    btn.addEventListener('click', () => writeRange(btn.dataset.range));
+  // [data-range] specifically: the grouping toggle reuses .range-tabs styling
+  // and its buttons would otherwise be read as range picks.
+  root.querySelectorAll('.range-tabs button[data-range]').forEach(btn => {
+    btn.addEventListener('click', () => writeHash({ range: btn.dataset.range, group }));
   });
 
   stackedBarChart(document.getElementById('ch-daily-billable'), {
@@ -171,7 +195,7 @@ function renderBundle(root, { totals, projects, sessions, tools, daily, byModel 
     })).filter(d => d.value > 0),
   );
 
-  const topProjects = projects.slice(0, 8);
+  const topProjects = chartRows.slice(0, 8);
   groupedBarChart(document.getElementById('ch-projects'), {
     categories: topProjects.map(p => {
       const name = p.project_name || p.project_slug;
@@ -192,6 +216,8 @@ function renderBundle(root, { totals, projects, sessions, tools, daily, byModel 
 
   // The project cell used to be the link to the session; it now holds the
   // workspace label (which may contain its own PR link), so the row navigates.
+  bindGroupToggle(root, 'ov-group', mode => writeHash({ range: range.key, group: mode }));
+
   root.querySelectorAll('tr.clickable').forEach(tr => {
     tr.style.cursor = 'pointer';
     tr.addEventListener('click', e => {
