@@ -1,5 +1,6 @@
 // app.js — router, state, fetch helpers
 import { disposeMountedCharts } from '/web/charts.js';
+import { enhanceTables, watchTables } from '/web/tables.js';
 
 export const $  = (sel, root=document) => root.querySelector(sel);
 export const $$ = (sel, root=document) => Array.from(root.querySelectorAll(sel));
@@ -346,6 +347,7 @@ async function render() {
   } catch (e) {
     $('#app').innerHTML = `<div class="card"><h2>Error</h2><pre>${fmt.htmlSafe(String(e.stack || e))}</pre></div>`;
   }
+  enhanceTables($('#app'));
 }
 
 async function firstRun() {
@@ -392,6 +394,7 @@ async function firstRun() {
 
 async function boot() {
   buildTopbar();
+  watchTables($('#app'));   // catches tables routes swap in after their first render
   setPrivacyMode(localStorage.getItem(PRIVACY_KEY) === '1');
   document.getElementById('privacy-toggle').addEventListener('click', () => {
     setPrivacyMode(!document.body.classList.contains('privacy-on'));
