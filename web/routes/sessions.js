@@ -116,6 +116,9 @@ function buildList(root, list, qs) {
   // empty until that setting is on and a refresh has run.
   const repos = [...new Set(list.map(s => s.repo).filter(Boolean))]
     .sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()));
+  // No repositories means the selector isn't rendered at all; drop any repo
+  // left in the URL so a stale link doesn't filter every row away invisibly.
+  if (!repos.length) state.repo = '';
 
   root.innerHTML = `
     <div class="card">
@@ -127,11 +130,11 @@ function buildList(root, list, qs) {
         </div>
       </div>
       <div class="flex" style="margin-bottom:10px;flex-wrap:wrap;gap:10px;align-items:center">
-        <select id="f-repo" style="min-width:150px" ${repos.length ? '' : 'disabled'}
-          title="${repos.length ? 'Filter by repository' : 'Turn on “Associate workspaces with GitHub PRs” in Settings to filter by repository'}">
-          <option value="">${repos.length ? 'all repositories' : 'no repositories'}</option>
+        ${repos.length ? `
+        <select id="f-repo" style="min-width:150px" title="Filter by repository">
+          <option value="">all repositories</option>
           ${repos.map(r => `<option value="${fmt.htmlSafe(r)}" ${r === state.repo ? 'selected' : ''}>${fmt.htmlSafe(r)}</option>`).join('')}
-        </select>
+        </select>` : ''}
         <span class="ac" style="min-width:170px"><input id="f-project" autocomplete="off" placeholder="all projects…" value="${fmt.htmlSafe(state.project)}" style="width:100%" title="Filter by project — type to autocomplete, or pick from the list"></span>
         <span class="ac" style="flex:1;min-width:180px"><input id="f-search" type="search" autocomplete="off" placeholder="search project or session…" value="${fmt.htmlSafe(state.q)}" style="width:100%" title="Substring match on project name or session id"></span>
         <input id="f-mincost" type="number" min="0" step="0.5" placeholder="min $" value="${fmt.htmlSafe(state.minCost)}" style="width:90px" title="Minimum cost (USD)">
@@ -262,7 +265,7 @@ function buildList(root, list, qs) {
   // Text/number inputs run through a debounce so typing stays smooth even with
   // hundreds of rows; selecting a datalist suggestion also fires 'input'.
   const refresh = debounce(() => { applyFilters(); writeState(lastCol, lastDir); }, 150);
-  el('#f-repo').addEventListener('change', e => {
+  el('#f-repo')?.addEventListener('change', e => {
     state.repo = e.target.value;
     applyFilters(); writeState(lastCol, lastDir);
   });
@@ -302,7 +305,7 @@ function buildList(root, list, qs) {
 
   el('#f-clear').addEventListener('click', () => {
     Object.assign(state, { repo: '', project: '', q: '', period: 'all', from: '', to: '', minCost: '', minTokens: '' });
-    el('#f-repo').value = '';
+    if (el('#f-repo')) el('#f-repo').value = '';
     el('#f-project').value = '';
     el('#f-search').value = '';
     el('#f-mincost').value = '';
