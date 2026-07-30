@@ -10,6 +10,9 @@ node_modules/
 docs/superpowers/
 claude_api_pricing.htm
 
+# Local env overrides — may contain machine-specific paths. .env.example is tracked.
+.env
+
 # Local launcher (per-user, not part of the public repo)
 start_dashboard.bat
 
