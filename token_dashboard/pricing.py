@@ -14,7 +14,7 @@ def load_pricing(path: Union[str, Path]) -> dict:
 
 def _tier_from_name(model: str) -> Optional[str]:
     m = (model or "").lower()
-    for tier in ("opus", "sonnet", "haiku"):
+    for tier in ("fable", "opus", "sonnet", "haiku"):
         if tier in m:
             return tier
     return None

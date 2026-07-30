@@ -18,7 +18,17 @@ class CliTests(unittest.TestCase):
         self.db = os.path.join(self.tmp, "t.db")
 
     def _run(self, *args):
-        env = {**os.environ, "TOKEN_DASHBOARD_DB": self.db}
+        # Isolate the subprocess from the developer's real ~/.claude/ —
+        # otherwise the filesystem-backed tips (skill-budget, claude-md-size)
+        # leak live data into a test that asserts a clean baseline.
+        fake_home = os.path.join(self.tmp, "fake_home")
+        os.makedirs(fake_home, exist_ok=True)
+        env = {
+            **os.environ,
+            "TOKEN_DASHBOARD_DB": self.db,
+            "HOME": fake_home,
+            "USERPROFILE": fake_home,
+        }
         return subprocess.run(
             [sys.executable, "cli.py", *args],
             cwd=ROOT, env=env, capture_output=True, text=True,

@@ -2,11 +2,22 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from pathlib import Path
-from typing import List, Optional, Tuple, Union
+from typing import Callable, List, Optional, Tuple, Union
 
-from .db import connect
+from .db import connect, rebuild_summaries, summaries_ready
+
+
+# Slash-command user messages (typed as `/foo` in Claude Code) arrive as a
+# user-role record whose content looks like `<command-name>/foo</command-name>`
+# (with optional `<command-message>`/`<command-args>` sibling tags, in any
+# order). The scanner synthesizes a `tool_name='Skill'` row from these so
+# user-invoked skills appear in skill_breakdown / skill_costs / skill_actuals
+# alongside assistant-initiated Skill tool_use blocks. Matches plugin-namespaced
+# slugs like `codex:review` via the `:` in the character class.
+_SLASH_CMD_RE = re.compile(r"<command-name>/([A-Za-z0-9_:-]+)</command-name>")
 
 
 INSERT_MSG = """
@@ -14,18 +25,18 @@ INSERT OR REPLACE INTO messages (
   uuid, parent_uuid, session_id, project_slug, cwd, git_branch, cc_version, entrypoint,
   type, is_sidechain, agent_id, timestamp, model, stop_reason, prompt_id, message_id,
   input_tokens, output_tokens, cache_read_tokens, cache_create_5m_tokens, cache_create_1h_tokens,
-  prompt_text, prompt_chars, tool_calls_json
+  prompt_text, prompt_chars, tool_calls_json, attribution_skill
 ) VALUES (
   :uuid, :parent_uuid, :session_id, :project_slug, :cwd, :git_branch, :cc_version, :entrypoint,
   :type, :is_sidechain, :agent_id, :timestamp, :model, :stop_reason, :prompt_id, :message_id,
   :input_tokens, :output_tokens, :cache_read_tokens, :cache_create_5m_tokens, :cache_create_1h_tokens,
-  :prompt_text, :prompt_chars, :tool_calls_json
+  :prompt_text, :prompt_chars, :tool_calls_json, :attribution_skill
 )
 """
 
 INSERT_TOOL = """
-INSERT INTO tool_calls (message_uuid, session_id, project_slug, tool_name, target, result_tokens, is_error, timestamp)
-VALUES (:message_uuid, :session_id, :project_slug, :tool_name, :target, :result_tokens, :is_error, :timestamp)
+INSERT INTO tool_calls (message_uuid, session_id, project_slug, tool_name, target, result_tokens, is_error, timestamp, tool_use_id)
+VALUES (:message_uuid, :session_id, :project_slug, :tool_name, :target, :result_tokens, :is_error, :timestamp, :tool_use_id)
 """
 
 
@@ -39,6 +50,7 @@ _TARGET_FIELDS = {
     "WebFetch":  "url",
     "WebSearch": "query",
     "Task":      "subagent_type",
+    "Agent":     "subagent_type",
     "Skill":     "skill",
 }
 
@@ -93,8 +105,44 @@ def _extract_tools(rec: dict) -> List[dict]:
             "result_tokens": None,
             "is_error":      0,
             "timestamp":     rec.get("timestamp"),
+            "tool_use_id":   block.get("id"),
         })
     return out
+
+
+def _extract_slash_commands(rec: dict) -> List[dict]:
+    """Return a synthetic `Skill` tool_call row when a user record carries a
+    `<command-name>/<slug></command-name>` tag. At most one per record.
+
+    Claude Code logs user-typed slash commands without emitting an assistant
+    `tool_use` block, so the base scanner misses them. We key the synthetic
+    row on the user message's uuid/timestamp so the existing per-message
+    dedup (``DELETE FROM tool_calls WHERE message_uuid=?``) keeps rescans
+    idempotent.
+    """
+    if rec.get("type") != "user":
+        return []
+    content = (rec.get("message") or {}).get("content")
+    if isinstance(content, str):
+        text = content
+    elif isinstance(content, list):
+        text = "".join(
+            b.get("text", "") for b in content
+            if isinstance(b, dict) and b.get("type") == "text"
+        )
+    else:
+        return []
+    m = _SLASH_CMD_RE.search(text)
+    if not m:
+        return []
+    return [{
+        "tool_name":     "Skill",
+        "target":        m.group(1),
+        "result_tokens": None,
+        "is_error":      0,
+        "timestamp":     rec.get("timestamp"),
+        "tool_use_id":   None,
+    }]
 
 
 def _extract_results(rec: dict) -> List[dict]:
@@ -118,6 +166,7 @@ def _extract_results(rec: dict) -> List[dict]:
             "result_tokens": chars // 4,
             "is_error":      1 if block.get("is_error") else 0,
             "timestamp":     rec.get("timestamp"),
+            "tool_use_id":   block.get("tool_use_id"),
         })
     return out
 
@@ -143,12 +192,14 @@ def parse_record(rec: dict, project_slug: str) -> Tuple[dict, List[dict]]:
         "stop_reason":  msg_obj.get("stop_reason"),
         "prompt_id":    rec.get("promptId"),
         "message_id":   msg_obj.get("id"),
-        "prompt_text":  text,
-        "prompt_chars": chars,
-        "tool_calls_json": None,
+        "prompt_text":       text,
+        "prompt_chars":      chars,
+        "tool_calls_json":   None,
+        "attribution_skill": rec.get("attributionSkill") or None,
         **_usage(rec),
     }
     tools = _extract_tools(rec)
+    tools.extend(_extract_slash_commands(rec))
     tools.extend(_extract_results(rec))
     if tools:
         msg["tool_calls_json"] = json.dumps(
@@ -166,33 +217,104 @@ def _project_slug(file_path: Path, projects_root: Path) -> str:
     return rel.parts[0]
 
 
-def _evict_prior_snapshots(conn, session_id: str, message_id: str, keep_uuid: str) -> None:
-    """Remove older streaming snapshots for the same (session_id, message_id).
+def _evict_prior_snapshots_bulk(conn, keepers: List[Tuple[str, str, str]]) -> None:
+    """Remove older streaming snapshots for many (session_id, message_id) pairs.
 
-    Claude Code writes 2–3 JSONL lines per assistant response (partial → final)
-    with identical message.id but distinct top-level uuids. Only the final
-    tally matches billing, so earlier snapshots must be replaced, not summed.
+    Claude Code writes several JSONL lines per assistant response sharing one
+    message.id but with distinct top-level uuids. Every sibling carries the
+    same final usage, so the message rows must be collapsed to one, not summed.
+
+    ``keepers`` is a list of ``(session_id, message_id, keep_uuid)`` triples
+    representing the final snapshot we are about to insert for each
+    ``(session_id, message_id)`` pair. For every prior DB row that matches the
+    pair but has a different uuid we re-point its tool_calls onto the keeper
+    (the siblings may hold distinct parallel tool_use blocks — issue #25) and
+    then delete the superseded message row. One temp-table-driven pass replaces
+    N inline SELECT+DELETE round-trips.
     """
-    old = [r[0] for r in conn.execute(
-        "SELECT uuid FROM messages WHERE session_id=? AND message_id=? AND uuid!=?",
-        (session_id, message_id, keep_uuid),
-    )]
-    if not old:
+    if not keepers:
         return
-    placeholders = ",".join("?" * len(old))
-    conn.execute(f"DELETE FROM tool_calls WHERE message_uuid IN ({placeholders})", old)
-    conn.execute(f"DELETE FROM messages WHERE uuid IN ({placeholders})", old)
+    conn.execute(
+        "CREATE TEMP TABLE IF NOT EXISTS _snap_keepers ("
+        " session_id TEXT NOT NULL,"
+        " message_id TEXT NOT NULL,"
+        " keep_uuid  TEXT NOT NULL,"
+        " PRIMARY KEY (session_id, message_id)"
+        ")"
+    )
+    conn.execute("DELETE FROM _snap_keepers")
+    conn.executemany(
+        "INSERT OR REPLACE INTO _snap_keepers (session_id, message_id, keep_uuid) VALUES (?, ?, ?)",
+        keepers,
+    )
+    pairs = [(r[0], r[1]) for r in conn.execute(
+        "SELECT m.uuid, k.keep_uuid FROM messages m "
+        "JOIN _snap_keepers k "
+        "  ON m.session_id = k.session_id AND m.message_id = k.message_id "
+        "WHERE m.uuid != k.keep_uuid"
+    )]
+    if pairs:
+        # Re-point the superseded siblings' tool_calls onto the surviving keeper
+        # rather than deleting them: in the current per-content-block format the
+        # siblings hold *distinct* parallel tool_use blocks, and the
+        # tool_calls→messages joins need message_uuid to resolve. Duplicate
+        # tool_use ids (true growing snapshots repeat a block) are collapsed by
+        # _dedupe_tool_calls after the insert.
+        conn.executemany(
+            "UPDATE tool_calls SET message_uuid = ? WHERE message_uuid = ?",
+            [(keep, old) for (old, keep) in pairs],
+        )
+        old_uuids = [old for (old, _keep) in pairs]
+        # SQLite's default SQLITE_MAX_VARIABLE_NUMBER is 999; chunk safely below it.
+        chunk = 500
+        for i in range(0, len(old_uuids), chunk):
+            slab = old_uuids[i:i + chunk]
+            ph = ",".join("?" * len(slab))
+            conn.execute(f"DELETE FROM messages WHERE uuid IN ({ph})", slab)
+    conn.execute("DELETE FROM _snap_keepers")
 
 
-def scan_file(path: Path, project_slug: str, conn, start_byte: int = 0) -> dict:
-    """Ingest new lines from a JSONL file starting at ``start_byte``.
+def _dedupe_tool_calls(conn, keep_uuids) -> None:
+    """Collapse duplicate tool_use rows under a keeper message.
 
-    Returns message/tool counts plus ``end_offset`` — the byte offset just
-    past the last fully-parsed line. Callers persist ``end_offset`` as the
-    file's high-water mark so a line partially flushed at EOF gets re-read
-    once it completes.
+    Re-pointing snapshot siblings onto the keeper can leave the same tool_use
+    block recorded more than once when the source was a true growing snapshot
+    (each partial repeats the block). Keep one row per
+    (message_uuid, tool_name, tool_use_id). Only rows carrying a tool_use id are
+    touched, so ``_tool_result`` rows and synthetic ``Skill`` rows (no id) are
+    left intact. All rows for a given message_uuid land in the same chunk, so
+    per-chunk grouping is exact.
     """
-    msgs = tools = 0
+    if not keep_uuids:
+        return
+    uuids = list(keep_uuids)
+    chunk = 500
+    for i in range(0, len(uuids), chunk):
+        slab = uuids[i:i + chunk]
+        ph = ",".join("?" * len(slab))
+        conn.execute(
+            f"""DELETE FROM tool_calls
+                 WHERE message_uuid IN ({ph})
+                   AND tool_use_id IS NOT NULL
+                   AND id NOT IN (
+                     SELECT MIN(id) FROM tool_calls
+                      WHERE message_uuid IN ({ph}) AND tool_use_id IS NOT NULL
+                      GROUP BY message_uuid, tool_name, tool_use_id
+                   )""",
+            slab + slab,
+        )
+
+
+def _parse_file(path: Path, project_slug: str, start_byte: int = 0) -> dict:
+    """Parse new lines from a JSONL file. No DB access — pure Python.
+
+    Returns a dict with the parsed messages, tool rows, and the byte offset
+    just past the last fully-parsed line. Splitting parsing from DB writes
+    lets the writer batch with ``executemany`` instead of paying a
+    round-trip per row.
+    """
+    messages: List[dict] = []
+    tools: List[dict] = []
     end_offset = start_byte
     with open(path, "rb") as fb:
         if start_byte:
@@ -227,37 +349,212 @@ def scan_file(path: Path, project_slug: str, conn, start_byte: int = 0) -> dict:
             if not msg["session_id"] or not msg["timestamp"]:
                 end_offset = line_end
                 continue
-            if msg["message_id"]:
-                _evict_prior_snapshots(conn, msg["session_id"], msg["message_id"], msg["uuid"])
-            conn.execute(INSERT_MSG, msg)
-            # tool_calls has no natural unique key; clear any prior rows for
-            # this uuid so full rescans stay idempotent instead of
-            # duplicating rows.
-            conn.execute("DELETE FROM tool_calls WHERE message_uuid=?", (msg["uuid"],))
-            for t in tlist:
-                conn.execute(INSERT_TOOL, t)
-                tools += 1
-            msgs += 1
+            messages.append(msg)
+            tools.extend(tlist)
             end_offset = line_end
-    return {"messages": msgs, "tools": tools, "end_offset": end_offset}
+    return {"messages": messages, "tools": tools, "end_offset": end_offset}
 
 
-def scan_dir(projects_root: Union[str, Path], db_path: Union[str, Path]) -> dict:
+def _dedupe_inflight_snapshots(
+    messages: List[dict],
+) -> Tuple[List[dict], List[Tuple[str, str, str]], dict]:
+    """Within one batch of parsed messages, keep only the last uuid per
+    (session_id, message_id), preserving order otherwise.
+
+    Returns (deduped_messages, keepers, uuid_to_keeper):
+      - keepers: (session_id, message_id, keep_uuid) triples for the bulk evictor.
+      - uuid_to_keeper: every record uuid in a message_id group → its keeper
+        uuid, so tool_calls carried by evicted siblings can be re-pointed at the
+        surviving row instead of dropped (issue #25 bug #1).
+    """
+    last_idx_by_key: dict = {}
+    members_by_key: dict = {}
+    for i, m in enumerate(messages):
+        mid = m["message_id"]
+        if not mid:
+            continue
+        key = (m["session_id"], mid)
+        last_idx_by_key[key] = i
+        members_by_key.setdefault(key, []).append(m["uuid"])
+    if not last_idx_by_key:
+        return messages, [], {}
+    keep_indices = set(last_idx_by_key.values())
+    deduped: List[dict] = []
+    for i, m in enumerate(messages):
+        if not m["message_id"] or i in keep_indices:
+            deduped.append(m)
+    keepers = [
+        (sid, mid, messages[idx]["uuid"]) for (sid, mid), idx in last_idx_by_key.items()
+    ]
+    uuid_to_keeper: dict = {}
+    for key, members in members_by_key.items():
+        keep_uuid = messages[last_idx_by_key[key]]["uuid"]
+        for u in members:
+            uuid_to_keeper[u] = keep_uuid
+    return deduped, keepers, uuid_to_keeper
+
+
+def scan_file(path: Path, project_slug: str, conn, start_byte: int = 0) -> dict:
+    """Ingest new lines from a JSONL file starting at ``start_byte``.
+
+    Returns message/tool counts plus ``end_offset`` — the byte offset just
+    past the last fully-parsed line. Callers persist ``end_offset`` as the
+    file's high-water mark so a line partially flushed at EOF gets re-read
+    once it completes.
+
+    Also returns ``days`` and ``sessions`` sets covering the messages just
+    written. ``scan_dir`` uses these to invalidate the correct slices of
+    the materialised summary tables.
+
+    Internally: parse all new lines into in-memory lists, collapse same
+    message.id snapshots to one row, re-point their tool_calls onto the
+    surviving keeper, batch-write via ``executemany``, evict prior snapshots,
+    then drop duplicate tool_use rows. Token totals match billing (siblings
+    repeat the final usage, never summed) while parallel tool_use blocks from
+    non-final siblings are preserved (issue #25 bug #1).
+    """
+    parsed = _parse_file(path, project_slug, start_byte=start_byte)
+    msgs_batch: List[dict] = parsed["messages"]
+    tools_batch: List[dict] = parsed["tools"]
+    end_offset: int = parsed["end_offset"]
+
+    if not msgs_batch:
+        return {"messages": 0, "tools": 0, "end_offset": end_offset,
+                "days": set(), "sessions": set()}
+
+    msgs_batch, keepers, uuid_to_keeper = _dedupe_inflight_snapshots(msgs_batch)
+    keep_uuids = {m["uuid"] for m in msgs_batch}
+    # Re-point each tool onto its group's surviving (keeper) message instead of
+    # dropping the evicted siblings' tools. Current Claude Code splits one
+    # response into disjoint per-content-block records, so parallel tool_use
+    # blocks live in non-final siblings; keeping them is what fixes the
+    # tool/skill undercount (issue #25 bug #1). message_uuid stays pointed at a
+    # real row so the tool_calls→messages joins still resolve.
+    for t in tools_batch:
+        t["message_uuid"] = uuid_to_keeper.get(t["message_uuid"], t["message_uuid"])
+
+    # tool_calls has no natural unique key; clear any prior rows for the keeper
+    # uuids we are about to insert so full rescans stay idempotent. Done BEFORE
+    # the evict re-point below so it cannot clobber re-pointed sibling tools.
+    uuids = list(keep_uuids)
+    chunk = 500
+    for i in range(0, len(uuids), chunk):
+        slab = uuids[i:i + chunk]
+        ph = ",".join("?" * len(slab))
+        conn.execute(f"DELETE FROM tool_calls WHERE message_uuid IN ({ph})", slab)
+
+    conn.executemany(INSERT_MSG, msgs_batch)
+    if tools_batch:
+        conn.executemany(INSERT_TOOL, tools_batch)
+
+    # Cross-batch: re-point any prior snapshot siblings' tools onto the new
+    # keeper and drop the superseded message rows. Then collapse the duplicate
+    # tool_use rows that re-pointing can create when a block was repeated.
+    _evict_prior_snapshots_bulk(conn, keepers)
+    _dedupe_tool_calls(conn, keep_uuids)
+
+    # Reconstruct the day/session sets scan_dir needs for the materialised
+    # summary rebuild. Done after dedupe so we never reference an evicted row.
+    days = {m["timestamp"][:10] for m in msgs_batch if m["timestamp"]}
+    sessions = {m["session_id"] for m in msgs_batch if m["session_id"]}
+
+    return {"messages": len(msgs_batch), "tools": len(tools_batch),
+            "end_offset": end_offset, "days": days, "sessions": sessions}
+
+
+def rescan_agent_targets(
+    db_path: Union[str, Path],
+    projects_root: Union[str, Path],
+) -> dict:
+    """Re-parse main-session JSONLs that hold ``tool_name='Agent'`` rows with
+    ``target IS NULL``.
+
+    Older scanner builds recognised only the legacy ``Task`` tool name;
+    Claude Code renamed it to ``Agent``, leaving historical rows without a
+    subagent_type to join on. Resetting those files' ``bytes_read`` makes
+    the next ``scan_dir`` re-parse them end-to-end. Dedup is handled by
+    ``INSERT OR REPLACE`` on messages + ``DELETE FROM tool_calls`` per
+    uuid, so repeated runs are safe.
+
+    One-shot utility: wire in at operator time, not on every scan.
+    """
+    with connect(db_path) as conn:
+        sessions = [
+            r["session_id"] for r in conn.execute(
+                "SELECT DISTINCT session_id FROM tool_calls "
+                "WHERE tool_name='Agent' AND target IS NULL"
+            )
+        ]
+        if not sessions:
+            return {"files_reset": 0, "messages": 0, "tools": 0, "files": 0}
+        paths: set[str] = set()
+        wanted = {f"{sid}.jsonl" for sid in sessions}
+        for row in conn.execute("SELECT path FROM files"):
+            # Match on the file's basename, not a "/"-anchored LIKE: files.path is
+            # the OS-native string, so on Windows it carries "\" separators and a
+            # "%/{sid}.jsonl" pattern would never match.
+            name = row["path"].replace("\\", "/").rsplit("/", 1)[-1]
+            if name in wanted:
+                paths.add(row["path"])
+        for p in paths:
+            conn.execute("UPDATE files SET bytes_read = 0 WHERE path = ?", (p,))
+        conn.commit()
+    result = scan_dir(projects_root, db_path)
+    return {"files_reset": len(paths), **result}
+
+
+def scan_dir(
+    projects_root: Union[str, Path],
+    db_path: Union[str, Path],
+    progress: Optional[Callable[[int, int, Path, dict], None]] = None,
+) -> dict:
+    """Incrementally scan JSONL transcripts under ``projects_root`` into the DB.
+
+    ``progress`` is called as ``progress(index, total, path, totals)`` after
+    each file is processed (skipped or scanned). ``index`` is 1-based.
+    """
     root = Path(projects_root)
     totals = {"messages": 0, "tools": 0, "files": 0}
     if not root.is_dir():
         return totals
+    # Commit every BATCH_SIZE files so the SQLite journal never grows large
+    # enough to spike RAM. Smaller batches also release the write lock more
+    # frequently so concurrent HTTP writes (e.g. POST /api/plan) can proceed.
+    BATCH_SIZE = 20
+    pending = 0
+    needs_full_summary_rebuild = not summaries_ready(db_path)
+    summary_days = set()
+    summary_sessions = set()
+    scan_started = time.perf_counter()
+    paths = list(root.rglob("*.jsonl"))
+    total = len(paths)
     with connect(db_path) as conn:
-        for p in root.rglob("*.jsonl"):
+        known_files = {
+            r["path"]: r for r in conn.execute("SELECT path, mtime, bytes_read FROM files")
+        }
+        for i, p in enumerate(paths, start=1):
             try:
                 stat = p.stat()
             except OSError:
+                if progress:
+                    progress(i, total, p, totals)
                 continue
-            row = conn.execute(
-                "SELECT mtime, bytes_read FROM files WHERE path=?", (str(p),)
-            ).fetchone()
+            path_s = str(p)
+            row = known_files.get(path_s)
             offset = 0
-            if row and row["mtime"] == stat.st_mtime and row["bytes_read"] == stat.st_size:
+            if row and row["bytes_read"] == stat.st_size:
+                if row["mtime"] != stat.st_mtime:
+                    conn.execute(
+                        "INSERT OR REPLACE INTO files (path, mtime, bytes_read, scanned_at) VALUES (?, ?, ?, ?)",
+                        (path_s, stat.st_mtime, row["bytes_read"], time.time()),
+                    )
+                    pending += 1
+                    if pending >= BATCH_SIZE:
+                        conn.commit()
+                        pending = 0
+                        time.sleep(0.05)  # yield so concurrent HTTP writes can acquire the lock
+                if progress:
+                    progress(i, total, p, totals)
                 continue
             if row and stat.st_size > row["bytes_read"]:
                 offset = row["bytes_read"]
@@ -268,10 +565,82 @@ def scan_dir(projects_root: Union[str, Path], db_path: Union[str, Path]) -> dict
             # scan instead of being skipped over.
             conn.execute(
                 "INSERT OR REPLACE INTO files (path, mtime, bytes_read, scanned_at) VALUES (?, ?, ?, ?)",
-                (str(p), stat.st_mtime, sub["end_offset"], time.time()),
+                (path_s, stat.st_mtime, sub["end_offset"], time.time()),
             )
             totals["messages"] += sub["messages"]
             totals["tools"]    += sub["tools"]
             totals["files"]    += 1
+            if sub["messages"] or sub["tools"]:
+                summary_days.update(sub["days"])
+                summary_sessions.update(sub["sessions"])
+            pending += 1
+            if pending >= BATCH_SIZE:
+                conn.commit()
+                pending = 0
+                time.sleep(0.05)  # yield so concurrent HTTP writes can acquire the lock
+            if progress:
+                progress(i, total, p, totals)
         conn.commit()
+    summary_started = time.perf_counter()
+    if needs_full_summary_rebuild:
+        rebuild_summaries(db_path)
+    elif summary_days or summary_sessions:
+        rebuild_summaries(db_path, days=summary_days, sessions=summary_sessions)
+    totals["scan_seconds"] = round(summary_started - scan_started, 3)
+    totals["summary_seconds"] = round(time.perf_counter() - summary_started, 3)
+    totals["summary_days"] = len(summary_days)
+    totals["summary_sessions"] = len(summary_sessions)
+    if totals["scan_seconds"] > 1 or totals["summary_seconds"] > 1:
+        print(
+            "token-dashboard scan "
+            f"scan={totals['scan_seconds']:.3f}s summary={totals['summary_seconds']:.3f}s "
+            f"messages={totals['messages']} tools={totals['tools']} files={totals['files']} "
+            f"days={totals['summary_days']} sessions={totals['summary_sessions']} "
+            f"full_summary={int(needs_full_summary_rebuild)}",
+            flush=True,
+        )
     return totals
+
+
+def rescan_slash_commands(db_path: Union[str, Path]) -> dict:
+    """Synthesize ``tool_name='Skill'`` rows for already-ingested slash-command
+    user messages. No filesystem re-read required — ``prompt_text`` already
+    holds the ``<command-name>/<slug></command-name>`` tag.
+
+    Idempotent: a prior synthetic row on the same ``message_uuid`` is deleted
+    before re-inserting, so repeated runs are safe. Real assistant-initiated
+    ``Skill`` tool_use rows have distinct ``message_uuid`` values and aren't
+    touched.
+
+    One-shot utility for DBs populated before this extractor existed.
+    """
+    synthesized = 0
+    with connect(db_path) as conn:
+        rows = list(conn.execute(
+            "SELECT uuid, session_id, project_slug, timestamp, prompt_text "
+            "FROM messages "
+            "WHERE type='user' AND prompt_text LIKE '%<command-name>/%'"
+        ))
+        for row in rows:
+            m = _SLASH_CMD_RE.search(row["prompt_text"] or "")
+            if not m:
+                continue
+            conn.execute(
+                "DELETE FROM tool_calls "
+                "WHERE message_uuid=? AND tool_name='Skill'",
+                (row["uuid"],),
+            )
+            conn.execute(INSERT_TOOL, {
+                "message_uuid":  row["uuid"],
+                "session_id":    row["session_id"],
+                "project_slug": row["project_slug"],
+                "tool_name":     "Skill",
+                "target":        m.group(1),
+                "result_tokens": None,
+                "is_error":      0,
+                "timestamp":     row["timestamp"],
+                "tool_use_id":   None,
+            })
+            synthesized += 1
+        conn.commit()
+    return {"slash_commands_synthesized": synthesized}

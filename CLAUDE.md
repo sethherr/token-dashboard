@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-Guidance for Claude Code when working in this repository.
+Guidance for Claude Code and other agents when working in this repository.
 
 ## Project overview
 
@@ -10,13 +10,14 @@ Inspired by [phuryn/claude-usage](https://github.com/phuryn/claude-usage) but di
 
 ## Status
 
-Working codebase. 68 Python unit tests (`python3 -m unittest discover tests`). Seven UI tabs wired up (Overview, Prompts, Sessions, Projects, Skills, Tips, Settings). Runs on macOS, Windows, and Linux.
+Working codebase. Python unit tests live in `tests/` (`python3 -m unittest discover tests`). UI tabs are JS modules in `web/routes/` (Overview, Prompts, Sessions, Projects, Workspaces, Subagents, Skills, Plugins, MCP, Hooks, RTK, Tips, Settings — Skills/Plugins/MCP/Hooks are grouped under a "Register ▾" nav dropdown). Runs on macOS, Windows, and Linux.
 
 ## Architecture
 
 - `cli.py` → `token_dashboard/scanner.py` → `~/.claude/token-dashboard.db` (SQLite)
 - `token_dashboard/server.py` exposes JSON APIs (`/api/*`) + SSE stream (`/api/stream`) + static frontend (`web/`)
 - `web/` is vanilla JS, no build step — hash router + ECharts
+- Each UI tab is one file in `web/routes/<tab>.js`; chart helpers live in `web/charts.js`; CSV export in `web/export.js`.
 
 ## Data source
 
@@ -27,16 +28,16 @@ Claude Code writes one JSONL file per session to `~/.claude/projects/<project-sl
 - **Fully local.** No telemetry, no remote calls for user data. Tests run offline.
 - **Stdlib only.** No `pip install`. If a new feature needs a third-party library, argue for it first — we're willing to pay ergonomics cost to keep install friction at zero.
 - **SQLite parameter binding always.** Any f-string in a SQL statement must interpolate only internal, caller-controlled values (column names, placeholder lists). User-reachable values go through `?`.
-- **Small files with clear responsibilities.** If a file grows past ~400 lines or accretes three distinct concerns, split it.
-- **Streaming-snapshot dedup.** When adding scanner logic that joins the `messages` table, remember `(session_id, message_id)` is the dedup key, not `uuid`. See `scanner._evict_prior_snapshots` and the migration note in `db._migrate_add_message_id`.
+- **Small files with clear responsibilities.** Prefer one concern per module. Once a file passes ~500 lines or starts accreting unrelated concerns, ask whether it's time to split — `db.py` and `server.py` are the current outliers and OK as-is.
+- **Streaming-snapshot dedup.** When adding scanner logic that joins the `messages` table, remember `(session_id, message_id)` is the dedup key, not `uuid`. See `scanner._evict_prior_snapshots_bulk` and the migration note in `db._migrate_add_message_id`.
 
 ## Customizing
 
-Env vars: `PORT` (default 8080), `HOST` (default 127.0.0.1), `CLAUDE_PROJECTS_DIR`, `TOKEN_DASHBOARD_DB`. Pricing lives in `pricing.json`. See README.md § Environment variables for details.
+Env vars: `PORT` (default 8080), `HOST` (default 127.0.0.1), `CLAUDE_PROJECTS_DIR`, `TOKEN_DASHBOARD_DB`. The UI can persist a `.claude` folder fallback for scans. Pricing lives in `pricing.json`. See README.md § Environment variables for details.
 
 ## Known limitations
 
-See `docs/KNOWN_LIMITATIONS.md`. Current summary: Skills `tokens_per_call` is populated only for skills installed under the three scanned roots (`~/.claude/skills/`, `~/.claude/scheduled-tasks/`, `~/.claude/plugins/`); project-local skills and subagent-dispatched skills show invocation counts but blank token counts.
+See `docs/KNOWN_LIMITATIONS.md`. Current summary: Skills `tokens_per_call` covers `~/.claude/skills/`, `~/.claude/scheduled-tasks/`, every `installPath` listed in `~/.claude/plugins/installed_plugins.json` (manifest-driven — marketplace clones excluded), plus project-local `.claude/skills/` directories discovered from cwds in the messages table. Only `Task`-dispatched subagent skills still show blank token counts. The **Register** catalogs (Plugins / MCP / Hooks) are manifest-driven the same way — installed plugins only, marketplace clones and disabled plugins excluded; the MCP page scans local `~/.claude.json` servers plus installed-plugin `.mcp.json` files and never lists account-level claude.ai connectors (no local config to read).
 
 ## Verifying changes
 

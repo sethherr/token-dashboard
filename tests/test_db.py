@@ -14,7 +14,7 @@ class InitDbTests(unittest.TestCase):
         init_db(self.db_path)
         with sqlite3.connect(self.db_path) as c:
             tables = {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
-        expected = {"files", "messages", "tool_calls", "plan", "dismissed_tips"}
+        expected = {"files", "messages", "tool_calls", "plan", "settings", "dismissed_tips"}
         self.assertTrue(expected.issubset(tables), f"Missing: {expected - tables}")
 
     def test_init_is_idempotent(self):
@@ -26,6 +26,18 @@ class InitDbTests(unittest.TestCase):
         with connect(self.db_path) as c:
             r = c.execute("SELECT 1 AS one").fetchone()
         self.assertEqual(r["one"], 1)
+
+    def test_init_creates_overview_range_indexes(self):
+        init_db(self.db_path)
+        with sqlite3.connect(self.db_path) as c:
+            indexes = {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='index'")}
+        expected = {
+            "idx_messages_timestamp_session",
+            "idx_messages_timestamp_project",
+            "idx_messages_type_timestamp_model",
+            "idx_tools_timestamp_name",
+        }
+        self.assertTrue(expected.issubset(indexes), f"Missing: {expected - indexes}")
 
 
 if __name__ == "__main__":

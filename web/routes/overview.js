@@ -1,7 +1,10 @@
-import { api, fmt, state } from '/web/app.js';
+import { api, fmt, state, cacheGet, cacheSet } from '/web/app.js';
 import { barChart, donutChart, groupedBarChart, stackedBarChart } from '/web/charts.js';
 
 const RANGES = [
+  { key: '1d',  label: '1d',  days: 1 },
+  { key: '2d',  label: '2d',  days: 2 },
+  { key: '3d',  label: '3d',  days: 3 },
   { key: '7d',  label: '7d',  days: 7 },
   { key: '30d', label: '30d', days: 30 },
   { key: '90d', label: '90d', days: 90 },
@@ -12,12 +15,13 @@ function readRange() {
   const q = (location.hash.split('?')[1] || '');
   const m = /(?:^|&)range=([^&]+)/.exec(q);
   const k = m && decodeURIComponent(m[1]);
-  return RANGES.find(r => r.key === k) || RANGES[1];
+  return RANGES.find(r => r.key === k) || RANGES.find(r => r.key === '30d');
 }
 
 function writeRange(key) {
-  const base = (location.hash.replace(/^#/, '').split('?')[0]) || '/overview';
-  location.hash = '#' + base + '?range=' + encodeURIComponent(key);
+  // Hardcoded base, not re-extracted from the current hash — matches
+  // workspaces.js/subagents.js after the code-review audit.
+  location.hash = '#/overview?range=' + encodeURIComponent(key);
 }
 
 function sinceIso(range) {
@@ -33,16 +37,21 @@ function withSince(url, since) {
 export default async function (root) {
   const range = readRange();
   const since = sinceIso(range);
+  const url   = withSince('/api/overview-bundle', since);
 
-  const [totals, projects, sessions, tools, daily, byModel] = await Promise.all([
-    api(withSince('/api/overview', since)),
-    api(withSince('/api/projects', since)),
-    api(withSince('/api/sessions?limit=10', since)),
-    api(withSince('/api/tools', since)),
-    api(withSince('/api/daily', since)),
-    api(withSince('/api/by-model', since)),
-  ]);
+  // Single render — cache hit is instant, cache miss hits warm server cache.
+  // No background prefetch: when the cache was just cleared (refresh / SSE
+  // scan event), prefetching all 4 ranges in parallel slammed the server
+  // with 4 cold-cache bundle queries simultaneously. Server's own warming
+  // threads cover this without piling on from the client.
+  const cached = cacheGet(url);
+  if (cached) { renderBundle(root, cached, range); return; }
+  const fresh = await api(url);
+  cacheSet(url, fresh);
+  renderBundle(root, fresh, range);
+}
 
+function renderBundle(root, { totals, projects, sessions, tools, daily, byModel }, range) {
   const cacheCreate =
     (totals.cache_create_5m_tokens || 0) +
     (totals.cache_create_1h_tokens || 0);
@@ -75,7 +84,7 @@ export default async function (root) {
       ${kpi('Cache create', fmt.compact(cacheCreate),               fmt.int(cacheCreate) + ' tokens')}
       <div class="card kpi cost">
         <div class="label">Est. cost</div>
-        <div class="value" title="${fmt.usd(totals.cost_usd)}">${fmt.usd(totals.cost_usd)}</div>
+        <div class="value blur-sensitive" title="API pay-per-token value of your usage — not your actual subscription bill">${fmt.usd(totals.cost_usd)}</div>
         ${planSubtitle()}
       </div>
     </div>
@@ -107,8 +116,8 @@ export default async function (root) {
     </div>
 
     <div class="row cols-2" style="margin-top:16px">
-      <div class="card"><h3>Tokens by project</h3><div id="ch-projects" style="height:320px"></div></div>
-      <div class="card">
+      <div class="card"><h3>Tokens by project</h3><div id="ch-projects" class="blur-sensitive" style="height:320px"></div></div>
+      <div class="card blur-sensitive">
         <h3>Token usage by model</h3>
         <p class="muted" style="margin:-4px 0 4px;font-size:12px">Share of billable tokens per Claude model.</p>
         <div id="ch-model" style="height:300px"></div>
@@ -125,7 +134,7 @@ export default async function (root) {
             ${sessions.map(s => `
               <tr>
                 <td class="mono">${fmt.ts(s.started)}</td>
-                <td><a href="#/sessions/${encodeURIComponent(s.session_id)}">${fmt.htmlSafe(s.project_name || s.project_slug)}</a></td>
+                <td><a href="#/sessions/${encodeURIComponent(s.session_id)}" class="blur-sensitive">${fmt.htmlSafe(s.project_name || s.project_slug)}</a></td>
                 <td class="num">${fmt.compact(s.tokens)}</td>
               </tr>`).join('') || '<tr><td colspan="3" class="muted">no sessions in this range</td></tr>'}
           </tbody>
@@ -134,12 +143,10 @@ export default async function (root) {
     </div>
   `;
 
-  // range buttons
   root.querySelectorAll('.range-tabs button').forEach(btn => {
     btn.addEventListener('click', () => writeRange(btn.dataset.range));
   });
 
-  // Your daily work — billable tokens (input + output + cache create)
   stackedBarChart(document.getElementById('ch-daily-billable'), {
     categories: daily.map(d => d.day),
     series: [
@@ -149,7 +156,6 @@ export default async function (root) {
     ],
   });
 
-  // Daily cache reads (separate — scale is 100× larger)
   stackedBarChart(document.getElementById('ch-daily-cache'), {
     categories: daily.map(d => d.day),
     series: [
@@ -157,7 +163,6 @@ export default async function (root) {
     ],
   });
 
-  // by-model doughnut
   donutChart(document.getElementById('ch-model'),
     byModel.map(m => ({
       name: fmt.modelShort(m.model) || 'unknown',
@@ -166,7 +171,6 @@ export default async function (root) {
     })).filter(d => d.value > 0),
   );
 
-  // tokens by project — input vs output
   const topProjects = projects.slice(0, 8);
   groupedBarChart(document.getElementById('ch-projects'), {
     categories: topProjects.map(p => {
@@ -179,7 +183,6 @@ export default async function (root) {
     ],
   });
 
-  // top tools
   const topTools = tools.slice(0, 8);
   barChart(document.getElementById('ch-tools'), {
     categories: topTools.map(t => t.tool_name),
@@ -192,5 +195,5 @@ function planSubtitle() {
   if (!state.pricing || state.plan === 'api') return '';
   const p = state.pricing.plans[state.plan];
   if (!p || !p.monthly) return '';
-  return `<div class="sub">pay $${p.monthly}/mo on ${fmt.htmlSafe(p.label)}</div>`;
+  return `<div class="sub blur-sensitive">pay $${p.monthly}/mo on ${fmt.htmlSafe(p.label)}</div>`;
 }

@@ -1,19 +1,116 @@
 {
   "models": {
-    "claude-opus-4-7":     { "tier": "opus",   "input": 15.00, "output": 75.00, "cache_read": 1.50, "cache_create_5m": 18.75, "cache_create_1h": 30.00 },
-    "claude-opus-4-6":     { "tier": "opus",   "input": 15.00, "output": 75.00, "cache_read": 1.50, "cache_create_5m": 18.75, "cache_create_1h": 30.00 },
-    "claude-sonnet-4-6":   { "tier": "sonnet", "input":  3.00, "output": 15.00, "cache_read": 0.30, "cache_create_5m":  3.75, "cache_create_1h":  6.00 },
-    "claude-haiku-4-5":    { "tier": "haiku",  "input":  1.00, "output":  5.00, "cache_read": 0.10, "cache_create_5m":  1.25, "cache_create_1h":  2.00 }
+    "claude-fable-5": {
+      "tier": "fable",
+      "input": 10.00,
+      "output": 50.00,
+      "cache_read": 1.00,
+      "cache_create_5m": 12.50,
+      "cache_create_1h": 20.00
+    },
+    "claude-opus-4-8": {
+      "tier": "opus",
+      "input": 5.00,
+      "output": 25.00,
+      "cache_read": 0.50,
+      "cache_create_5m": 6.25,
+      "cache_create_1h": 10.00
+    },
+    "claude-opus-4-7": {
+      "tier": "opus",
+      "input": 5.00,
+      "output": 25.00,
+      "cache_read": 0.50,
+      "cache_create_5m": 6.25,
+      "cache_create_1h": 10.00
+    },
+    "claude-opus-4-6": {
+      "tier": "opus",
+      "input": 5.00,
+      "output": 25.00,
+      "cache_read": 0.50,
+      "cache_create_5m": 6.25,
+      "cache_create_1h": 10.00
+    },
+    "claude-sonnet-5": {
+      "tier": "sonnet",
+      "input": 3.00,
+      "output": 15.00,
+      "cache_read": 0.30,
+      "cache_create_5m": 3.75,
+      "cache_create_1h": 6.00
+    },
+    "claude-sonnet-4-6": {
+      "tier": "sonnet",
+      "input": 3.00,
+      "output": 15.00,
+      "cache_read": 0.30,
+      "cache_create_5m": 3.75,
+      "cache_create_1h": 6.00
+    },
+    "claude-haiku-4-5": {
+      "tier": "haiku",
+      "input": 1.00,
+      "output": 5.00,
+      "cache_read": 0.10,
+      "cache_create_5m": 1.25,
+      "cache_create_1h": 2.00
+    }
   },
   "tier_fallback": {
-    "opus":   { "input": 15.00, "output": 75.00, "cache_read": 1.50, "cache_create_5m": 18.75, "cache_create_1h": 30.00 },
-    "sonnet": { "input":  3.00, "output": 15.00, "cache_read": 0.30, "cache_create_5m":  3.75, "cache_create_1h":  6.00 },
-    "haiku":  { "input":  1.00, "output":  5.00, "cache_read": 0.10, "cache_create_5m":  1.25, "cache_create_1h":  2.00 }
+    "fable": {
+      "input": 10.00,
+      "output": 50.00,
+      "cache_read": 1.00,
+      "cache_create_5m": 12.50,
+      "cache_create_1h": 20.00
+    },
+    "opus": {
+      "input": 15.00,
+      "output": 75.00,
+      "cache_read": 1.50,
+      "cache_create_5m": 18.75,
+      "cache_create_1h": 30.00
+    },
+    "sonnet": {
+      "input": 3.00,
+      "output": 15.00,
+      "cache_read": 0.30,
+      "cache_create_5m": 3.75,
+      "cache_create_1h": 6.00
+    },
+    "haiku": {
+      "input": 1.00,
+      "output": 5.00,
+      "cache_read": 0.10,
+      "cache_create_5m": 1.25,
+      "cache_create_1h": 2.00
+    }
   },
   "plans": {
-    "api":     { "monthly": 0,   "label": "API (pay-per-token)" },
-    "pro":     { "monthly": 20,  "label": "Pro" },
-    "max":     { "monthly": 100, "label": "Max" },
-    "max-20x": { "monthly": 200, "label": "Max 20x" }
+    "api": {
+      "monthly": 0,
+      "label": "API (pay-per-token)"
+    },
+    "pro": {
+      "monthly": 20,
+      "label": "Pro"
+    },
+    "max": {
+      "monthly": 100,
+      "label": "Max"
+    },
+    "max-20x": {
+      "monthly": 200,
+      "label": "Max 20x"
+    },
+    "team": {
+      "monthly": 25,
+      "label": "Team Standard"
+    },
+    "team-premium": {
+      "monthly": 125,
+      "label": "Team Premium"
+    }
   }
 }

@@ -14,7 +14,7 @@ import time
 import unittest
 
 from token_dashboard.db import init_db
-from token_dashboard.scanner import scan_dir
+from token_dashboard.scanner import scan_dir, rescan_agent_targets
 
 
 def _assistant_with_tool_use(uuid: str, msg_id: str, ts: str, output_tokens: int) -> dict:
@@ -132,11 +132,53 @@ class RescanIdempotencyTests(unittest.TestCase):
         future = time.time() + 10
         os.utime(self._jsonl_path(), (future, future))
 
-        scan_dir(self.proj_root, self.db)
+        n2 = scan_dir(self.proj_root, self.db)
+        self.assertEqual(
+            n2["messages"], 0,
+            "mtime-only changes with the same byte size should not reparse the file",
+        )
         self.assertEqual(
             self._count_tools(), 1,
             "rescan must not duplicate tool_calls — INSERT needs to clear per-message first",
         )
+
+
+class RescanAgentTargetsTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.db = os.path.join(self.tmp, "t.db")
+        self.proj_root = os.path.join(self.tmp, "projects")
+        os.makedirs(self.proj_root)
+        init_db(self.db)
+
+    def test_links_session_to_file_regardless_of_path_separator(self):
+        # rescan_agent_targets links a session to its JSONL by filename. files.path
+        # is stored OS-native, so on Windows it carries "\" separators; the old
+        # "%/{sid}.jsonl" LIKE never matched a backslash path, so the file was
+        # silently not reset. Store a Windows-style path so this is deterministic
+        # on any OS.
+        sid = "sess-abc"
+        win_path = f"C:\\proj\\{sid}.jsonl"
+        with sqlite3.connect(self.db) as c:
+            c.execute(
+                "INSERT INTO files (path, mtime, bytes_read, scanned_at) VALUES (?, 1, 500, 1)",
+                (win_path,),
+            )
+            c.execute(
+                "INSERT INTO tool_calls (message_uuid, session_id, project_slug, tool_name, target, timestamp) "
+                "VALUES ('m1', ?, 'p', 'Agent', NULL, '2026-04-10T00:00:00Z')",
+                (sid,),
+            )
+            c.commit()
+
+        result = rescan_agent_targets(self.db, self.proj_root)
+
+        self.assertEqual(result["files_reset"], 1)
+        with sqlite3.connect(self.db) as c:
+            self.assertEqual(
+                c.execute("SELECT bytes_read FROM files WHERE path=?", (win_path,)).fetchone()[0],
+                0,
+            )
 
 
 if __name__ == "__main__":

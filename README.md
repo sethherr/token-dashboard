@@ -1,4 +1,6 @@
-# Token Dashboard
+# Token Dashboard (mucky fork)
+
+> **Fork notice.** This is a personal fork of [nateherkai/token-dashboard](https://github.com/nateherkai/token-dashboard) with several community pull requests integrated because upstream is currently inactive. See [FORK_NOTES.md](FORK_NOTES.md) for the full list of integrated changes and what differs from upstream.
 
 A local dashboard that reads the JSONL transcripts Claude Code writes to `~/.claude/projects/` and turns them into per-prompt cost analytics, tool/file heatmaps, subagent attribution, cache analytics, project comparisons, and a rule-based tips engine.
 
@@ -27,7 +29,7 @@ No `pip install`. No Node.js. No build step.
 ## Quickstart
 
 ```bash
-git clone https://github.com/nateherkai/token-dashboard.git
+git clone https://github.com/muckybuzzwoo/token-dashboard.git
 cd token-dashboard
 python3 cli.py dashboard
 ```
@@ -35,7 +37,7 @@ python3 cli.py dashboard
 > On Windows, if `python3` isn't on your PATH, substitute `py -3` for `python3` in every command below.
 
 The command:
-1. Scans `~/.claude/projects/` (first run can take 20–60 seconds on a heavy user's machine).
+1. Scans `~/.claude/projects/` (first run is fast in this fork — around 5–10 seconds for ~600 files / 60k+ messages thanks to the batched-insert scanner from PR #18).
 2. Starts a local server at http://127.0.0.1:8080.
 3. Opens your default browser to that URL.
 
@@ -57,6 +59,8 @@ To point at a different location:
 ```bash
 python3 cli.py dashboard --projects-dir /path/to/projects --db /path/to/cache.db
 ```
+
+You can also change the `.claude` folder from the Settings tab. Changing the folder controls future scans; it does not automatically partition old cached data in the current SQLite DB. When switching accounts or profiles, either enable **Clear cached transcript data** in Settings before saving, or launch with a separate `--db` path if you want to keep each folder's dashboard history isolated.
 
 ### Environment variables
 
@@ -85,19 +89,25 @@ python3 cli.py dashboard --no-scan   # skip the initial scan (use cached DB only
 
 Change the port: `PORT=9000 python3 cli.py dashboard`.
 
-## The 7 tabs
+## The tabs
 
-The dashboard is a single page with a hash-router tab bar across the top. Each tab is backed by its own JSON API under `/api/`:
+The dashboard is a single page with a hash-router tab bar across the top; **Skills & Commands, Plugins, MCP and Hooks live under a "Register ▾" dropdown**, the rest are top-level tabs. Each tab is backed by its own JSON API under `/api/`:
 
 - **Overview** — all-time input/output/cache tokens, sessions, turns, estimated cost on your chosen plan, daily work and cache-read charts, tokens-by-project, token share by model, top tools by call count, and recent sessions. This is the landing tab.
-- **Prompts** — your most expensive user prompts ranked by tokens. Click any row to see the assistant response, tool calls made, and the size of each tool result.
+- **Prompts** — your most expensive user prompts ranked by tokens. Click any row to see the assistant response, tool calls made, and the size of each tool result. Has a "Copy MD" / "Download CSV" export for the current sort/filter.
 - **Sessions** — turn-by-turn view of any single session, with per-turn tokens and tool calls.
 - **Projects** — per-project comparison: tokens, session counts, and which files were touched most.
-- **Skills** — which skills you invoke most often, and (where we can measure them) their token cost. See [limitations](docs/KNOWN_LIMITATIONS.md#skills-token-counts-are-partial).
-- **Tips** — rule-based suggestions for reducing token usage (repeated file reads, oversized tool results, low cache-hit rate, etc.).
-- **Settings** — switch pricing between API / Pro / Max / Max-20x so cost figures everywhere else reflect your actual plan.
+- **Workspaces** — bipartite ECharts Sankey of agent cwd (left) → file target (right), counting Read/Edit/Write/NotebookEdit only. Same-name pairs are within-workspace work; cross-pairs are CLAUDE.md consolidation candidates. Includes a ranked cross-workspace leaks table with the top files driving each pair.
+- **Subagents & Orchestration** — per-model spend split into **main thread** vs **Task subagent** vs **auto-compaction** (`agent_id LIKE 'acompact-*'`), a per-entrypoint chart (`cli` / `claude-vscode` / SDK runs), an external-orchestration table for `sdk-py`/`sdk-ts`/`sdk-cli` sessions, and a dispatcher → child agent dispatch tree reconstructed via session_id + timing-join.
+- **Skills & Commands** — split between **You ran** (distinct sessions where you typed a `/slash-command`, tracked via Claude Code's native `attributionSkill` field) and **Claude invoked** (real `Skill` tool calls Claude emitted itself, typically from `Task`/`Agent`-dispatched subagents). Also shows per-skill output-token budget (parsed from `SKILL.md`) vs. measured p50/p95, total cost, and total including subagent attribution. See [limitations](docs/KNOWN_LIMITATIONS.md#skills-tokens-per-call-is-blank-when-a-skill-runs-only-through-taskagent).
+- **Plugins** *(under Register)* — every plugin in `~/.claude/plugins/installed_plugins.json`: enabled/disabled state, source marketplace, version, component counts (skills / agents / commands) and an approximate always-on token cost. Read-only; "Open in editor" jumps to the plugin's install path.
+- **MCP** *(under Register)* — configured MCP servers: local ones from `~/.claude.json` plus servers shipped by installed, enabled plugins (their `.mcp.json`). Account-level claude.ai connectors (Gmail, Calendar, Slack) aren't listed — they have no local config to read. See [limitations](docs/KNOWN_LIMITATIONS.md).
+- **Hooks / Commands / Agents** *(under Register)* — configured hooks from `settings.json` (with a broken-script check), your user commands from `~/.claude/commands/`, and commands/agents shipped by installed plugins.
+- **RTK** — optional [rtk](https://github.com/rtk-ai/rtk) savings view if the CLI is installed at `~/.local/bin/rtk`. Gracefully degrades on Windows or when RTK is absent (shows install instructions).
+- **Tips** — rule-based suggestions for reducing token usage. 19 detectors covering cache-hit rate, repeated file reads, repeated Bash commands, Opus turns that would fit on Sonnet, oversized tool results, subagent outliers, skill-listing budget pressure (scope-aware: reports effective per-session footprint and splits global vs project-scoped skills, named after the most-active recent project), oversized `CLAUDE.md`, cross-workspace leaks, dead skills (90d unused, excluding project-scoped skills in projects you haven't visited), subagent sprawl (sidechain dominates main thread), Bash bloat (commands without output limiters), context-window pressure, repeated identical Bash errors, heavy web-fetch sessions, Opus-only workspaces, MCP-server sprawl, stacked `CLAUDE.md` files, and overlong skill descriptions. Detectors that flag several items (e.g. repeated files, cross-workspace leaks, context-heavy sessions) group their instances into **one collapsible section** — the shared advice shown once, the concrete instances listed collapsed below with a per-instance dismiss. Each tip is dismissable for 14 days; drill-down links jump to the responsible session, project, or skill.
+- **Settings** — pick your plan (API / Pro / Max / Max-20x / Team). This does **not** change the dollar figures shown elsewhere — they're always the API pay-per-token value of your usage — it just shows your flat monthly fee next to them for comparison, so you can see whether your usage is worth more than you pay. Also lets you switch the `.claude` folder at runtime.
 
-The Overview tab also has a built-in "What do these numbers mean?" panel that explains input/output/cache tokens in plain English.
+Most data-heavy tabs carry a built-in, collapsible **explanation panel** (look for the "— click to expand" hint): the Overview's "What do these numbers mean?" glossary, plus column/chart guides on Prompts, Skills & Commands, Subagents and Workspaces. Each defines its metrics in plain English — what they measure, an example, and what you can read out of them — and is collapsed by default to keep the view uncluttered.
 
 ## Troubleshooting
 
@@ -105,7 +115,7 @@ The Overview tab also has a built-in "What do these numbers mean?" panel that ex
 
 **Port 8080 already in use.** `PORT=9000 python3 cli.py dashboard`.
 
-**Numbers look wrong / stuck.** The DB lives at `~/.claude/token-dashboard.db`. Delete it and re-run `python3 cli.py scan` to rebuild from scratch.
+**Numbers look wrong / stuck.** The DB lives at `~/.claude/token-dashboard.db`. Delete it and re-run `python3 cli.py scan` to rebuild from scratch. If you changed the `.claude` folder in Settings, use **Clear cached transcript data** when saving the new folder to avoid combining data from multiple transcript roots.
 
 **Running the dashboard twice at the same time.** Don't — both processes will fight over the SQLite DB. Stop all instances before starting a new one.
 
