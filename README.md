@@ -35,7 +35,7 @@ python3 cli.py dashboard
 > On Windows, if `python3` isn't on your PATH, substitute `py -3` for `python3` in every command below.
 
 The command:
-1. Scans `~/.claude/projects/` (first run can take 20–60 seconds on a heavy user's machine).
+1. Scans `~/.claude/projects/`, showing a progress bar while it works. The first run reads every transcript and can take several minutes if you have a large `~/.claude/projects/`; later runs only read what changed and finish in a second or two.
 2. Starts a local server at http://127.0.0.1:8080.
 3. Opens your default browser to that URL.
 

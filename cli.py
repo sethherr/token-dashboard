@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from token_dashboard.db import init_db, default_db_path, overview_totals
+from token_dashboard.progress import TerminalProgress
 from token_dashboard.scanner import scan_dir
 from token_dashboard.tips import all_tips
 
@@ -31,10 +32,18 @@ def _today_range():
     return start, end
 
 
+def _scan_with_progress(args, db) -> dict:
+    bar = TerminalProgress()
+    try:
+        return scan_dir(_projects(args), db, progress=bar)
+    finally:
+        bar.finish()
+
+
 def cmd_scan(args):
     db = _db_path(args)
     init_db(db)
-    n = scan_dir(_projects(args), db)
+    n = _scan_with_progress(args, db)
     print(f"Token Dashboard: scanned {n['files']} files, {n['messages']} messages, {n['tools']} tool calls")
 
 
@@ -74,7 +83,9 @@ def cmd_dashboard(args):
     db = _db_path(args)
     init_db(db)
     if not args.no_scan:
-        scan_dir(_projects(args), db)
+        n = _scan_with_progress(args, db)
+        if n["files"]:
+            print(f"Token Dashboard: scanned {n['files']} new/changed files, {n['messages']} messages")
     from token_dashboard.server import run
 
     host = os.environ.get("HOST", "127.0.0.1")

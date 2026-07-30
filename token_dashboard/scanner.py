@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 import time
 from pathlib import Path
-from typing import List, Optional, Tuple, Union
+from typing import Callable, List, Optional, Tuple, Union
 
 from .db import connect
 
@@ -242,36 +242,60 @@ def scan_file(path: Path, project_slug: str, conn, start_byte: int = 0) -> dict:
     return {"messages": msgs, "tools": tools, "end_offset": end_offset}
 
 
-def scan_dir(projects_root: Union[str, Path], db_path: Union[str, Path]) -> dict:
+def scan_dir(
+    projects_root: Union[str, Path],
+    db_path: Union[str, Path],
+    progress: Optional[Callable[[int, int, int, int], None]] = None,
+) -> dict:
+    """Ingest every JSONL transcript under ``projects_root``.
+
+    ``progress``, if given, is called as
+    ``progress(done_files, total_files, done_bytes, total_bytes)`` once per
+    file (plus once at 0 before any work). Progress is weighted by bytes
+    rather than file count because transcript sizes vary by orders of
+    magnitude; unchanged files still count toward ``done`` so a warm rescan
+    sweeps to 100%.
+    """
     root = Path(projects_root)
     totals = {"messages": 0, "tools": 0, "files": 0}
     if not root.is_dir():
+        if progress:
+            progress(0, 0, 0, 0)
         return totals
+    entries = []
+    for p in root.rglob("*.jsonl"):
+        try:
+            entries.append((p, p.stat()))
+        except OSError:
+            continue
+    total_files = len(entries)
+    total_bytes = sum(s.st_size for _, s in entries)
+    done_files = done_bytes = 0
+    if progress:
+        progress(0, total_files, 0, total_bytes)
     with connect(db_path) as conn:
-        for p in root.rglob("*.jsonl"):
-            try:
-                stat = p.stat()
-            except OSError:
-                continue
+        for p, stat in entries:
             row = conn.execute(
                 "SELECT mtime, bytes_read FROM files WHERE path=?", (str(p),)
             ).fetchone()
-            offset = 0
-            if row and row["mtime"] == stat.st_mtime and row["bytes_read"] == stat.st_size:
-                continue
-            if row and stat.st_size > row["bytes_read"]:
-                offset = row["bytes_read"]
-            slug = _project_slug(p, root)
-            sub = scan_file(p, slug, conn, start_byte=offset)
-            # Persist the byte offset of the last fully-parsed line (not
-            # st_size) so a partial line mid-flush is retried on the next
-            # scan instead of being skipped over.
-            conn.execute(
-                "INSERT OR REPLACE INTO files (path, mtime, bytes_read, scanned_at) VALUES (?, ?, ?, ?)",
-                (str(p), stat.st_mtime, sub["end_offset"], time.time()),
-            )
-            totals["messages"] += sub["messages"]
-            totals["tools"]    += sub["tools"]
-            totals["files"]    += 1
+            unchanged = bool(row) and row["mtime"] == stat.st_mtime and row["bytes_read"] == stat.st_size
+            if not unchanged:
+                offset = row["bytes_read"] if row and stat.st_size > row["bytes_read"] else 0
+                slug = _project_slug(p, root)
+                sub = scan_file(p, slug, conn, start_byte=offset)
+                # Persist the byte offset of the last fully-parsed line (not
+                # st_size) so a partial line mid-flush is retried on the next
+                # scan instead of being skipped over.
+                conn.execute(
+                    "INSERT OR REPLACE INTO files (path, mtime, bytes_read, scanned_at) VALUES (?, ?, ?, ?)",
+                    (str(p), stat.st_mtime, sub["end_offset"], time.time()),
+                )
+                totals["messages"] += sub["messages"]
+                totals["tools"]    += sub["tools"]
+                totals["files"]    += 1
+            done_files += 1
+            done_bytes += stat.st_size
+            if progress:
+                progress(done_files, total_files, done_bytes, total_bytes)
         conn.commit()
     return totals
