@@ -642,13 +642,17 @@ def workspace_branches(db_path) -> dict:
 
     Where a workspace was used on several branches over its life, the most
     recent one wins — that's the identity it ended up with.
+
+    ``HEAD`` is excluded rather than treated as the latest branch: it is what
+    a detached checkout records, not a branch name, and letting it win would
+    discard a real branch the same workspace reported earlier.
     """
     out: dict = {}
     with connect(db_path) as c:
         for r in c.execute(
             "SELECT cwd, project_slug, git_branch, MAX(timestamp) AS t FROM messages "
             "WHERE cwd IS NOT NULL AND project_slug IS NOT NULL "
-            "  AND git_branch IS NOT NULL AND git_branch != '' "
+            "  AND git_branch IS NOT NULL AND git_branch != '' AND git_branch != 'HEAD' "
             "GROUP BY cwd, project_slug, git_branch ORDER BY t"
         ):
             root = _workspace_root_path(r["cwd"], r["project_slug"]) or r["cwd"]

@@ -59,14 +59,19 @@ worktrees as well as live ones. Two facts outlive the directory: the branch
 4. **targeted PR queries** for branches older than the bulk window.
 5. **cross-repo search** (`gh search prs --head`) for workspaces with no
    inferrable repo. The search reports which repo the branch belongs to, so
-   this tier corroborates rather than guesses; a branch name matching PRs in
-   two repos is refused instead of picked.
+   this tier corroborates rather than guesses. Where a branch name matches
+   PRs in two repos — common when shared tooling is synced between projects
+   on identically-named branches — the workspace's parent directory name
+   breaks the tie, choosing only among repos GitHub returned. With no
+   matching hint, the match is refused rather than guessed.
 
-On a real 313-workspace history where only 22 directories still exist, 310
-resolve and 272 get a PR number. What remains is genuinely unresolvable:
+On a real 313-workspace history where only 22 directories still exist, 312
+resolve and 273 get a PR number. What remains is genuinely unresolvable:
 
-- **detached HEAD** — the transcript recorded `HEAD`, not a branch name, so
-  there is nothing to match;
+- **detached HEAD for the whole of a workspace's life** — the transcript only
+  ever recorded `HEAD`, which is not a branch name, so there is nothing to
+  match. (A workspace that reported a real branch *and later* went detached
+  keeps the real branch: `HEAD` never displaces one.)
 - **branches that never had a PR** — local-only work;
 - **generic branch names** (`main`, `master`, `develop`) are deliberately not
   attributed by inference: they exist in every repo, so a match would prove

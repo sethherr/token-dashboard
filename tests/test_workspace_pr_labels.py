@@ -697,3 +697,44 @@ class StatusBreakdownTests(unittest.TestCase):
         for k in ("checked", "linked", "with_pr", "on_disk", "inferred"):
             self.assertEqual(st[k], 0, k)
         self.assertIsNone(st["last_checked"])
+
+
+class RecordedBranchTests(unittest.TestCase):
+    """`HEAD` is what a detached checkout records, not a branch name."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.db = os.path.join(self.tmp, "w.db")
+        init_db(self.db)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _msg(self, uuid, cwd, slug, branch, ts):
+        from token_dashboard.db import connect
+        with connect(self.db) as c:
+            c.execute(
+                "INSERT INTO messages (uuid, session_id, project_slug, cwd, git_branch, "
+                "type, timestamp) VALUES (?,?,?,?,?,?,?)",
+                (uuid, "s1", slug, cwd, branch, "user", ts),
+            )
+            c.commit()
+
+    def test_head_does_not_displace_an_earlier_real_branch(self):
+        from token_dashboard.db import workspace_branches
+        self._msg("m1", "/ws/x/chisinau", "-ws-x-chisinau", "sethherr/chisinau",
+                  "2026-05-01T00:00:00Z")
+        self._msg("m2", "/ws/x/chisinau", "-ws-x-chisinau", "HEAD",
+                  "2026-05-02T00:00:00Z")  # later, but detached
+        self.assertEqual(workspace_branches(self.db)["/ws/x/chisinau"], "sethherr/chisinau")
+
+    def test_latest_real_branch_still_wins(self):
+        from token_dashboard.db import workspace_branches
+        self._msg("m1", "/ws/x/w", "-ws-x-w", "feature/old", "2026-05-01T00:00:00Z")
+        self._msg("m2", "/ws/x/w", "-ws-x-w", "feature/new", "2026-05-02T00:00:00Z")
+        self.assertEqual(workspace_branches(self.db)["/ws/x/w"], "feature/new")
+
+    def test_head_only_workspace_has_no_branch(self):
+        from token_dashboard.db import workspace_branches
+        self._msg("m1", "/ws/x/detached", "-ws-x-detached", "HEAD", "2026-05-01T00:00:00Z")
+        self.assertNotIn("/ws/x/detached", workspace_branches(self.db))

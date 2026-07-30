@@ -507,3 +507,78 @@ class ResolveAllSearchTierTests(unittest.TestCase):
         )
         self.assertEqual(stats["searches"], 2)
         self.assertEqual(stats["throttled"], 3)
+
+
+class SearchDisambiguationTests(unittest.TestCase):
+    """A branch name can exist in two repos; the parent directory names one."""
+
+    BOTH = ('[{"number": 101, "title": "Sync pr skill", "state": "merged", "url": "u1",'
+            '  "repository": {"nameWithOwner": "sethherr/rails_template"}},'
+            ' {"number": 3782, "title": "Trigger pr skill", "state": "merged", "url": "u2",'
+            '  "repository": {"nameWithOwner": "bikeindex/bike_index"}}]')
+
+    def test_ambiguous_without_a_hint(self):
+        self.assertIsNone(P.search_pr("sethherr/update-pr-skill", gh_bin="gh",
+                                      runner=fake_runner({"search prs": self.BOTH})))
+
+    def test_hint_picks_the_matching_repo(self):
+        pr = P.search_pr("sethherr/update-pr-skill", gh_bin="gh",
+                         runner=fake_runner({"search prs": self.BOTH}),
+                         prefer_repo="rails_template")
+        self.assertEqual(pr["number"], 101)
+        self.assertEqual(pr["repo_slug"], "sethherr/rails_template")
+
+    def test_hint_is_case_insensitive(self):
+        pr = P.search_pr("b", gh_bin="gh", runner=fake_runner({"search prs": self.BOTH}),
+                         prefer_repo="Rails_Template")
+        self.assertEqual(pr["repo_slug"], "sethherr/rails_template")
+
+    def test_a_hint_matching_nothing_still_refuses(self):
+        self.assertIsNone(P.search_pr("b", gh_bin="gh",
+                                      runner=fake_runner({"search prs": self.BOTH}),
+                                      prefer_repo="some-other-repo"))
+
+    def test_hint_cannot_invent_a_repo_github_did_not_return(self):
+        one = ('[{"number": 5, "title": "T", "state": "open", "url": "u",'
+               '  "repository": {"nameWithOwner": "me/only"}}]')
+        pr = P.search_pr("b", gh_bin="gh", runner=fake_runner({"search prs": one}),
+                         prefer_repo="something-else")
+        self.assertEqual(pr["repo_slug"], "me/only", "unambiguous result is unaffected")
+
+
+class ParentDirNameTests(unittest.TestCase):
+    def test_posix_and_windows(self):
+        self.assertEqual(P.parent_dir_name("/ws/conductor/rails_template/lisbon"), "rails_template")
+        self.assertEqual(P.parent_dir_name(r"C:\ws\rails_template\lisbon"), "rails_template")
+
+    def test_trailing_separator_and_shallow_paths(self):
+        self.assertEqual(P.parent_dir_name("/ws/repo/alpha/"), "repo")
+        self.assertIsNone(P.parent_dir_name("/alpha"))
+        self.assertIsNone(P.parent_dir_name(""))
+
+
+class ResolveAllHintTests(unittest.TestCase):
+    def test_orphan_workspace_resolves_via_the_directory_hint(self):
+        both = SearchDisambiguationTests.BOTH
+        rows, stats = P.resolve_all(
+            ["/ws/conductor/rails_template/lisbon"],
+            recorded_branches={"/ws/conductor/rails_template/lisbon": "sethherr/update-pr-skill"},
+            git_bin="git", gh_bin="gh",
+            runner=fake_runner({"search prs": both}),
+        )
+        self.assertEqual(rows[0]["label"], "rails_template: #101 - Sync pr skill")
+        self.assertEqual(stats["found_by_search"], 1)
+
+    def test_same_branch_under_two_parents_resolves_separately(self):
+        """The search cache must key on the hint, not the branch alone."""
+        both = SearchDisambiguationTests.BOTH
+        paths = ["/ws/rails_template/a", "/ws/bike_index/b"]
+        rows, _ = P.resolve_all(
+            paths,
+            recorded_branches={p: "shared/branch" for p in paths},
+            git_bin="git", gh_bin="gh",
+            runner=fake_runner({"search prs": both}),
+        )
+        by_path = {r["path"]: r for r in rows}
+        self.assertEqual(by_path["/ws/rails_template/a"]["repo"], "rails_template")
+        self.assertEqual(by_path["/ws/bike_index/b"]["repo"], "bike_index")

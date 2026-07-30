@@ -283,7 +283,7 @@ def fetch_repo_prs(repo_slug_: str, gh_bin=_AUTO, runner: Callable = _run,
 
 
 def search_pr(branch: Optional[str], owners=(), gh_bin=_AUTO,
-              runner: Callable = _run) -> Optional[dict]:
+              runner: Callable = _run, prefer_repo: Optional[str] = None) -> Optional[dict]:
     """Find a PR by head branch across repos, via GitHub's search API.
 
     The last resort for a workspace whose directory is gone *and* whose repo
@@ -292,7 +292,12 @@ def search_pr(branch: Optional[str], owners=(), gh_bin=_AUTO,
     answer is corroborated by GitHub rather than guessed.
 
     Ambiguity is refused: if the branch name matches PRs in more than one
-    repo, we return nothing instead of picking one.
+    repo, we return nothing instead of picking one — unless ``prefer_repo``
+    names one of them. That hint is the workspace's parent directory, which
+    worktree tooling names after the repo, so it discriminates between two
+    repos that genuinely share a branch name (common when syncing shared
+    tooling between projects on identically-named branches). It only ever
+    chooses among candidates GitHub itself returned.
     """
     if not branch or branch in GENERIC_BRANCHES:
         return None
@@ -319,7 +324,15 @@ def search_pr(branch: Optional[str], owners=(), gh_bin=_AUTO,
     repos = {(r.get("repository") or {}).get("nameWithOwner") for r in rows}
     repos.discard(None)
     if len(repos) != 1:
-        return None  # same branch name in several repos — no way to choose
+        # Same branch name in several repos. Only the directory hint can break
+        # the tie; without a match, refuse rather than guess.
+        hint = (prefer_repo or "").strip().lower()
+        matches = [r for r in rows
+                   if hint and (repo_display((r.get("repository") or {}).get("nameWithOwner")) or "").lower() == hint]
+        if not matches:
+            return None
+        rows = matches
+        repos = {(matches[0].get("repository") or {}).get("nameWithOwner")}
     best = max(rows, key=lambda r: r["number"])
     return {
         "number": int(best["number"]),
@@ -329,6 +342,16 @@ def search_pr(branch: Optional[str], owners=(), gh_bin=_AUTO,
         "url": str(best.get("url") or "").strip(),
         "repo_slug": repos.pop(),
     }
+
+
+def parent_dir_name(path: str) -> Optional[str]:
+    """Basename of a workspace's parent directory — the repo, by convention."""
+    parent = _parent_dir(path)
+    if not parent:
+        return None
+    sep = "\\" if "\\" in parent else "/"
+    name = parent.rstrip(sep).rsplit(sep, 1)[-1]
+    return name or None
 
 
 def _parent_dir(path: str) -> str:
@@ -392,7 +415,9 @@ def resolve_all(paths, recorded_branches=None, git_bin=_AUTO, gh_bin=_AUTO,
        by ``max_lookups``.
     5. **cross-repo search** for workspaces with a branch but no repo at all
        (no live siblings to inherit from), bounded by ``max_searches``. The
-       search reports the repo, so nothing here is guessed.
+       search reports the repo, so nothing here is guessed; where a branch
+       name exists in two repos, the workspace's parent directory name breaks
+       the tie.
 
     ``bulk_limit=0`` skips phase 3 entirely — right for incremental top-ups of
     a handful of workspaces, where fetching a repo's whole PR list would cost
@@ -495,12 +520,17 @@ def resolve_all(paths, recorded_branches=None, git_bin=_AUTO, gh_bin=_AUTO,
         elif not repo_slug_ and p["branch"] and p["branch"] not in GENERIC_BRANCHES:
             # No repo to query — ask GitHub which repo this branch belongs to.
             branch = p["branch"]
-            if branch in search_cache:
-                pr = search_cache[branch]
+            # Cache per (branch, hint): the same branch under two different
+            # parent directories can legitimately resolve to different repos.
+            hint = parent_dir_name(path)
+            key = (branch, hint)
+            if key in search_cache:
+                pr = search_cache[key]
             elif searches < max_searches:
                 searches += 1
-                pr = search_pr(branch, owners=owners, gh_bin=gh_bin, runner=runner)
-                search_cache[branch] = pr
+                pr = search_pr(branch, owners=owners, gh_bin=gh_bin, runner=runner,
+                               prefer_repo=hint)
+                search_cache[key] = pr
             else:
                 throttled += 1
             if pr:
