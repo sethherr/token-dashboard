@@ -236,8 +236,8 @@ def right_size_tips(db_path, today_iso: Optional[str] = None) -> List[dict]:
     return [_make_tip(
         key=key, category="right-size", severity="cost",
         title=f"{row['n']} short Opus turns might fit on Sonnet",
-        body=(f"Opus turns under 500 output tokens cost ~${api_opus:.2f} in the last 7 days. "
-              f"Sonnet would have cost ~${api_sonnet:.2f}."),
+        body=(f"Opus turns under 500 output tokens cost ~${api_opus:,.2f} in the last 7 days. "
+              f"Sonnet would have cost ~${api_sonnet:,.2f}."),
         scope="opus-short-turns-7d",
         links=[
             {"label": "Browse short prompts", "href": "#/prompts?sort=tokens"},

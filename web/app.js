@@ -5,11 +5,14 @@ export const $  = (sel, root=document) => root.querySelector(sel);
 export const $$ = (sel, root=document) => Array.from(root.querySelectorAll(sel));
 
 const COMPACT = new Intl.NumberFormat('en', { notation: 'compact', maximumFractionDigits: 1 });
+// Money always gets thousands separators; the digit count is what varies.
+const USD  = new Intl.NumberFormat('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const USD4 = new Intl.NumberFormat('en-US', { minimumFractionDigits: 4, maximumFractionDigits: 4 });
 export const fmt = {
   int:   n => (n ?? 0).toLocaleString(),
   compact: n => COMPACT.format(n ?? 0),
-  usd:   n => n == null ? '—' : '$' + Number(n).toFixed(2),
-  usd4:  n => n == null ? '—' : '$' + Number(n).toFixed(4),
+  usd:   n => n == null ? '—' : '$' + USD.format(Number(n)),
+  usd4:  n => n == null ? '—' : '$' + USD4.format(Number(n)),
   pct:   n => n == null ? '—' : (n * 100).toFixed(0) + '%',
   short: (s, n=80) => s == null ? '' : (s.length > n ? s.slice(0, n - 1) + '…' : s),
   htmlSafe: s => (s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])),
@@ -355,7 +358,7 @@ async function firstRun() {
       <h2>Welcome — pick your plan</h2>
       <p>This sets how costs are displayed. Change it later in Settings.</p>
       <select id="firstplan" class="blur-sensitive" style="width:100%">
-        ${plans.map(([k,v]) => `<option value="${fmt.htmlSafe(k)}">${fmt.htmlSafe(v.label)}${v.monthly ? ` — $${v.monthly}/mo` : ''}</option>`).join('')}
+        ${plans.map(([k,v]) => `<option value="${fmt.htmlSafe(k)}">${fmt.htmlSafe(v.label)}${v.monthly ? ` — $${fmt.int(v.monthly)}/mo` : ''}</option>`).join('')}
       </select>
       <div class="actions">
         <div class="spacer"></div>
