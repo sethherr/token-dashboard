@@ -54,5 +54,35 @@ class CliTests(unittest.TestCase):
         self.assertIn("no suggestions", r.stdout)
 
 
+class EnvFlagTests(unittest.TestCase):
+    """NO_AUTO_OPEN_BROWSER and friends: only explicit truthy values count."""
+
+    def setUp(self):
+        sys.path.insert(0, ROOT)
+        import cli
+        self.cli = cli
+        self.addCleanup(sys.path.remove, ROOT)
+
+    def _with(self, value):
+        prev = os.environ.get("NO_AUTO_OPEN_BROWSER")
+        if value is None:
+            os.environ.pop("NO_AUTO_OPEN_BROWSER", None)
+        else:
+            os.environ["NO_AUTO_OPEN_BROWSER"] = value
+        if prev is None:
+            self.addCleanup(os.environ.pop, "NO_AUTO_OPEN_BROWSER", None)
+        else:
+            self.addCleanup(os.environ.__setitem__, "NO_AUTO_OPEN_BROWSER", prev)
+        return self.cli._env_flag("NO_AUTO_OPEN_BROWSER")
+
+    def test_truthy(self):
+        for v in ("1", "true", "TRUE", "True", " yes ", "on"):
+            self.assertTrue(self._with(v), v)
+
+    def test_falsy(self):
+        for v in (None, "", "0", "false", "no", "off", "maybe"):
+            self.assertFalse(self._with(v), repr(v))
+
+
 if __name__ == "__main__":
     unittest.main()

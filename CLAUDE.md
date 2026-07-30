@@ -34,7 +34,7 @@ Claude Code writes one JSONL file per session to `~/.claude/projects/<project-sl
 
 ## Customizing
 
-Env vars: `PORT` (default 8080), `HOST` (default 127.0.0.1), `CLAUDE_PROJECTS_DIR`, `TOKEN_DASHBOARD_DB`, `TOKEN_DASHBOARD_RTK_BIN`, `TOKEN_DASHBOARD_GIT_BIN`, `TOKEN_DASHBOARD_GH_BIN`. The UI can persist a `.claude` folder fallback for scans. Pricing lives in `pricing.json`. See README.md § Environment variables for details.
+Env vars: `PORT` (default 8080), `HOST` (default 127.0.0.1), `NO_AUTO_OPEN_BROWSER` (default false), `CLAUDE_PROJECTS_DIR`, `TOKEN_DASHBOARD_DB`, `TOKEN_DASHBOARD_RTK_BIN`, `TOKEN_DASHBOARD_GIT_BIN`, `TOKEN_DASHBOARD_GH_BIN`. The UI can persist a `.claude` folder fallback for scans. Pricing lives in `pricing.json`. See README.md § Environment variables for details.
 
 ## Known limitations
 

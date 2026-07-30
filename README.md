@@ -68,6 +68,7 @@ You can also change the `.claude` folder from the Settings tab. Changing the fol
 |---|---|---|
 | `PORT` | `8080` | Port the local web server listens on |
 | `HOST` | `127.0.0.1` | Bind address. Keep the default. Setting `0.0.0.0` exposes your entire prompt history to anyone on your local network — don't do this on any network you don't fully control (no coffee-shop Wi-Fi, no coworking spaces). |
+| `NO_AUTO_OPEN_BROWSER` | `false` | Set to `1`/`true`/`yes`/`on` to skip opening a browser tab on startup — same as `--no-open` |
 | `CLAUDE_PROJECTS_DIR` | `~/.claude/projects` | Where to scan for session JSONL files |
 | `TOKEN_DASHBOARD_DB` | `~/.claude/token-dashboard.db` | SQLite cache location |
 | `TOKEN_DASHBOARD_RTK_BIN` | auto-detected | Path to the `rtk` binary for the RTK tab. Only needed if `rtk` isn't on `PATH` or in a common install dir. |
@@ -86,7 +87,7 @@ python3 cli.py tips          # active suggestions (terminal)
 python3 cli.py dashboard     # scan + serve the UI at http://localhost:8080
 
 # dashboard flags
-python3 cli.py dashboard --no-open   # don't auto-open the browser
+python3 cli.py dashboard --no-open   # don't auto-open the browser (or NO_AUTO_OPEN_BROWSER=true)
 python3 cli.py dashboard --no-scan   # skip the initial scan (use cached DB only)
 ```
 
