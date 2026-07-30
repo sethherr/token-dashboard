@@ -377,7 +377,8 @@ def _row(path, repo_slug_=None, branch=None, is_main=False, pr=None,
 
 def resolve_all(paths, recorded_branches=None, git_bin=_AUTO, gh_bin=_AUTO,
                 runner: Callable = _run, bulk_limit: int = DEFAULT_PR_FETCH,
-                max_lookups: int = 200, max_searches: int = 100) -> Tuple[List[dict], dict]:
+                max_lookups: int = 200, max_searches: int = 100,
+                on_progress: Optional[Callable] = None) -> Tuple[List[dict], dict]:
     """Resolve every workspace path, including ones no longer on disk.
 
     Four phases, cheapest first:
@@ -396,6 +397,10 @@ def resolve_all(paths, recorded_branches=None, git_bin=_AUTO, gh_bin=_AUTO,
     a handful of workspaces, where fetching a repo's whole PR list would cost
     far more than querying each branch.
 
+    ``on_progress``, if given, is called with
+    ``{"phase", "done", "total", "detail"}`` as work proceeds — a full refresh
+    takes the better part of a minute, so the UI needs something to show.
+
     Returns ``(rows, stats)``.
     """
     recorded = dict(recorded_branches or {})
@@ -405,12 +410,21 @@ def resolve_all(paths, recorded_branches=None, git_bin=_AUTO, gh_bin=_AUTO,
         gh_bin = find_gh()
     paths = list(paths)
 
+    def progress(phase, done=0, total=0, detail=None):
+        if on_progress:
+            try:
+                on_progress({"phase": phase, "done": done, "total": total, "detail": detail})
+            except Exception:
+                pass  # a reporting failure must never abort the refresh
+
     # ── 1. local git ─────────────────────────────────────────────────────────
+    progress("inspect", 0, len(paths))
     live: dict = {}
-    for path in paths:
+    for i, path in enumerate(paths, 1):
         info = inspect_workspace(path, git_bin=git_bin, runner=runner)
         if info:
             live[path] = info
+        progress("inspect", i, len(paths), path)
 
     # ── 2. inference for the rest ────────────────────────────────────────────
     sibling_repo = infer_repos_by_sibling({p: i.get("repo_slug") for p, i in live.items()})
@@ -442,8 +456,12 @@ def resolve_all(paths, recorded_branches=None, git_bin=_AUTO, gh_bin=_AUTO,
     }
     indexes: dict = {}
     if bulk_limit > 0:
-        for slug in sorted(wanted_repos):
+        total_repos = len(wanted_repos)
+        progress("repos", 0, total_repos)
+        for i, slug in enumerate(sorted(wanted_repos), 1):
+            progress("repos", i - 1, total_repos, slug)
             indexes[slug] = fetch_repo_prs(slug, gh_bin=gh_bin, runner=runner, limit=bulk_limit)
+            progress("repos", i, total_repos, slug)
 
     # ── 4. targeted lookups for what the bulk window missed ──────────────────
     owners = sorted({slug.split("/")[0] for slug in wanted_repos if "/" in slug})
@@ -451,7 +469,8 @@ def resolve_all(paths, recorded_branches=None, git_bin=_AUTO, gh_bin=_AUTO,
     # Same branch in the same unknown repo appears under several workspaces;
     # search once and reuse.
     search_cache: dict = {}
-    for path in paths:
+    progress("match", 0, len(paths))
+    for done, path in enumerate(paths, 1):
         p = plan[path]
         pr = None
         repo_slug_ = p["repo_slug"]
@@ -481,6 +500,7 @@ def resolve_all(paths, recorded_branches=None, git_bin=_AUTO, gh_bin=_AUTO,
                 searched_ok += 1
         rows.append(_row(path, repo_slug_, p["branch"], p["is_main"], pr,
                          resolved=resolved, inferred=inferred))
+        progress("match", done, len(paths), path)
     stats = {
         "checked": len(paths),
         "live": len(live),

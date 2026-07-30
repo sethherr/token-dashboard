@@ -385,7 +385,7 @@ MAX_WORKSPACE_PR_LOOKUPS = 200
 MAX_WORKSPACE_PATHS = 5000  # runaway guard only
 
 
-def _refresh_workspace_prs(db_path: str, paths=None, resolver=None) -> dict:
+def _refresh_workspace_prs(db_path: str, paths=None, resolver=None, on_progress=None) -> dict:
     """Resolve every known workspace to its repo/PR and cache the result.
 
     Deleted worktrees are resolved too: the branch comes from the transcripts
@@ -407,6 +407,7 @@ def _refresh_workspace_prs(db_path: str, paths=None, resolver=None) -> dict:
             recorded_branches=workspace_branches(db_path),
             git_bin=git_bin, gh_bin=gh_bin,
             max_lookups=MAX_WORKSPACE_PR_LOOKUPS,
+            on_progress=on_progress,
         )
     except Exception as e:
         return {"checked": 0, "resolved": 0, "with_pr": 0, "error": str(e),
@@ -451,6 +452,73 @@ def _top_up_workspace_prs(db_path: str, resolver=None, now=None) -> dict:
         return {"checked": 0, "error": str(e)}
     save_workspace_prs(db_path, rows)
     return {**stats, "pending": max(0, len(paths) - len(capped))}
+
+
+# One refresh at a time: it's a long network job, and two concurrent passes
+# would interleave their progress events into nonsense.
+WORKSPACE_PR_LOCK = threading.Lock()
+_WORKSPACE_PR_PROGRESS: dict = {"running": False}
+_WORKSPACE_PR_PROGRESS_LOCK = threading.Lock()
+_PROGRESS_MIN_INTERVAL = 0.2  # seconds between pushed events
+
+
+def workspace_pr_progress() -> dict:
+    with _WORKSPACE_PR_PROGRESS_LOCK:
+        return dict(_WORKSPACE_PR_PROGRESS)
+
+
+def _set_workspace_pr_progress(**fields) -> dict:
+    with _WORKSPACE_PR_PROGRESS_LOCK:
+        _WORKSPACE_PR_PROGRESS.update(fields)
+        return dict(_WORKSPACE_PR_PROGRESS)
+
+
+def _refresh_workspace_prs_async(db_path: str, resolver=None) -> dict:
+    """Kick off a full refresh in the background, streaming progress over SSE.
+
+    Returns immediately: a full pass is ~a minute of network calls, far too
+    long to hold a request open. Progress arrives as ``workspace-prs`` events
+    and is also readable from ``/api/workspace-prs/status`` for a client that
+    reconnects mid-run.
+    """
+    if not WORKSPACE_PR_LOCK.acquire(blocking=False):
+        return {"started": False, "reason": "already-running", **workspace_pr_progress()}
+
+    state = _set_workspace_pr_progress(
+        running=True, phase="starting", done=0, total=0, detail=None,
+        started_at=time.time(), finished_at=None, stats=None, error=None)
+    _publish_event({"type": "workspace-prs", **state})
+
+    def work():
+        last = [0.0]
+
+        def on_progress(p):
+            now = time.time()
+            # Throttle: "inspect" fires once per workspace and would otherwise
+            # push hundreds of events a second down the stream.
+            final = p.get("done") and p.get("done") == p.get("total")
+            if not final and now - last[0] < _PROGRESS_MIN_INTERVAL:
+                _set_workspace_pr_progress(**p)
+                return
+            last[0] = now
+            _publish_event({"type": "workspace-prs", **_set_workspace_pr_progress(**p)})
+
+        try:
+            out = _refresh_workspace_prs(db_path, resolver=resolver, on_progress=on_progress)
+            _cache_clear()
+            state = _set_workspace_pr_progress(
+                running=False, phase="done", finished_at=time.time(), stats=out,
+                error=out.get("error"))
+        except Exception as e:
+            state = _set_workspace_pr_progress(
+                running=False, phase="error", finished_at=time.time(), error=str(e))
+        finally:
+            WORKSPACE_PR_LOCK.release()
+        _publish_event({"type": "workspace-prs", **state,
+                        "workspace_prs": _workspace_pr_status(db_path)})
+
+    threading.Thread(target=work, daemon=True).start()
+    return {"started": True, **state}
 
 
 def _workspace_label(info: dict) -> Optional[str]:
@@ -513,10 +581,15 @@ def _apply_workspace_labels(db_path: str, payload, name_keys=("project_name",),
 
 
 def _apply_sankey_labels(db_path: str, matrix: dict) -> dict:
-    """Relabel Sankey node names, keeping the ' (agent)'/' (files)' suffixes.
+    """Relabel Sankey nodes, keeping the ' (agent)'/' (files)' suffixes.
 
     Node names are also link endpoints, so both sides have to be rewritten
     with the same mapping or ECharts drops the links.
+
+    Relabelling is many-to-one — several worktrees can carry the same PR, and
+    every worktree of a repo shares one "main worktree" label — so distinct
+    nodes collapse onto one name. ECharts' Sankey requires unique node names
+    and throws on duplicates, so merged nodes and their links are combined.
     """
     if not workspace_pr_links_enabled(db_path) or not isinstance(matrix, dict):
         return matrix
@@ -540,11 +613,37 @@ def _apply_sankey_labels(db_path: str, matrix: dict) -> dict:
             rename[name] = new
             node["name_original"] = name
             node["name"] = new
-    for link in matrix.get("links") or []:
-        if link.get("source") in rename:
-            link["source"] = rename[link["source"]]
-        if link.get("target") in rename:
-            link["target"] = rename[link["target"]]
+
+    if rename:
+        # Merge nodes that now share a name, keeping every path they stand for
+        # so the tooltip can still say which directories are behind the label.
+        merged: dict = {}
+        for node in matrix.get("nodes") or []:
+            name = node.get("name")
+            keep = merged.get(name)
+            if keep is None:
+                node["workspace_paths"] = [p for p in [node.get("workspace_path")] if p]
+                merged[name] = node
+                continue
+            path = node.get("workspace_path")
+            if path and path not in keep["workspace_paths"]:
+                keep["workspace_paths"].append(path)
+        matrix["nodes"] = list(merged.values())
+
+        for link in matrix.get("links") or []:
+            if link.get("source") in rename:
+                link["source"] = rename[link["source"]]
+            if link.get("target") in rename:
+                link["target"] = rename[link["target"]]
+        # Two links can now join the same pair; sum them into one ribbon.
+        combined: dict = {}
+        for link in matrix.get("links") or []:
+            key = (link.get("source"), link.get("target"))
+            if key in combined:
+                combined[key]["value"] = (combined[key].get("value") or 0) + (link.get("value") or 0)
+            else:
+                combined[key] = link
+        matrix["links"] = list(combined.values())
     return matrix
 
 
@@ -745,7 +844,7 @@ def build_handler(db_path: str, projects_dir: Optional[str] = None):
                 cached = _cache_get(cache_key)
                 if cached is not None:
                     return _send_json(self, cached)
-                data = session_turns(db_path, sid)
+                data = _apply_workspace_labels(db_path, session_turns(db_path, sid))
                 _cache_set(cache_key, data)
                 return _send_json(self, data)
             if path == "/api/workspaces":
@@ -788,10 +887,10 @@ def build_handler(db_path: str, projects_dir: Optional[str] = None):
                         c = cost_for(r["model"], r, pricing)
                         r["cost_usd"] = c["usd"]
                         r["cost_estimated"] = c["estimated"]
-                tree = dispatch_tree(
+                tree = _apply_workspace_labels(db_path, dispatch_tree(
                     db_path, limit=_clamp_limit(qs.get("limit", ["50"])[0], 50),
                     since=since, until=until,
-                )
+                ))
                 for r in tree:
                     child_models = r["models"] or []
                     if child_models:
@@ -838,6 +937,9 @@ def build_handler(db_path: str, projects_dir: Optional[str] = None):
                 return _send_json(self, scan_commands())
             if path == "/api/agents":
                 return _send_json(self, scan_agents())
+            if path == "/api/workspace-prs/status":
+                return _send_json(self, {**workspace_pr_progress(),
+                                         "workspace_prs": _workspace_pr_status(db_path)})
             if path == "/api/settings":
                 return _send_json(self, _settings_payload(db_path, projects_dir))
             if path == "/api/scan":
@@ -911,15 +1013,15 @@ def build_handler(db_path: str, projects_dir: Optional[str] = None):
                     _cache_clear()  # cached payloads carry the old labels
                     result = {"ok": True}
                     if enabled and body.get("refresh", True):
-                        result.update(_refresh_workspace_prs(db_path))
+                        result.update(_refresh_workspace_prs_async(db_path))
                     return _send_json(self, {**result, "workspace_prs": _workspace_pr_status(db_path)})
                 if url.path == "/api/workspace-prs/refresh":
                     if not workspace_pr_links_enabled(db_path):
                         return _send_error(self, 400, "workspace PR links are turned off")
-                    result = _refresh_workspace_prs(db_path)
-                    _cache_clear()
-                    return _send_json(self, {"ok": True, **result,
-                                             "workspace_prs": _workspace_pr_status(db_path)})
+                    started = _refresh_workspace_prs_async(db_path)
+                    # 202: the work runs in the background and reports over SSE.
+                    return _send_json(self, {"ok": True, **started},
+                                      status=202 if started.get("started") else 409)
                 if url.path == "/api/tips/dismiss":
                     dismiss_tip(db_path, body.get("key", ""))
                     _cache_clear()

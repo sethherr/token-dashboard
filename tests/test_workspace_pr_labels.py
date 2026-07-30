@@ -370,3 +370,203 @@ class StoredLabelFormatTests(unittest.TestCase):
         rows = [{"project_name": "bikeindex", "workspace_path": "/m"}]
         server._apply_workspace_labels(self.db, rows)
         self.assertEqual(rows[0]["project_name"], "widgets: main worktree")
+
+
+class RefreshProgressTests(unittest.TestCase):
+    """The full refresh runs in the background and reports progress."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.db = os.path.join(self.tmp, "w.db")
+        init_db(self.db)
+        set_setting(self.db, server.WORKSPACE_PR_SETTING, "1")
+        server._set_workspace_pr_progress(running=False, phase=None, done=0, total=0)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_resolve_all_reports_each_phase(self):
+        from token_dashboard import pr_links as P
+        seen = []
+        P.resolve_all(["/a", "/b"], recorded_branches={},
+                      git_bin="git", gh_bin="gh",
+                      runner=lambda args, timeout: None,
+                      on_progress=seen.append)
+        phases = [p["phase"] for p in seen]
+        self.assertIn("inspect", phases)
+        self.assertIn("match", phases)
+        last = [p for p in seen if p["phase"] == "match"][-1]
+        self.assertEqual(last["done"], last["total"], "ends at 100%")
+
+    def test_a_failing_progress_callback_never_aborts_the_refresh(self):
+        from token_dashboard import pr_links as P
+
+        def boom(_):
+            raise RuntimeError("ui exploded")
+
+        rows, stats = P.resolve_all(["/a"], recorded_branches={}, git_bin="git",
+                                    gh_bin="gh", runner=lambda a, t: None,
+                                    on_progress=boom)
+        self.assertEqual(stats["checked"], 1)
+
+    def test_async_refresh_publishes_events_and_finishes(self):
+        import time as _time
+        events = []
+        unsub = server._EVENT_SUBS
+        q = server._subscribe()
+
+        def resolver(paths, recorded_branches=None, on_progress=None, **kw):
+            if on_progress:
+                on_progress({"phase": "inspect", "done": 1, "total": 1, "detail": "/a"})
+            return [], {"checked": 1, "resolved": 0, "with_pr": 0}
+
+        out = server._refresh_workspace_prs_async(self.db, resolver=resolver)
+        self.assertTrue(out["started"])
+        deadline = _time.time() + 5
+        while _time.time() < deadline:
+            if not server.workspace_pr_progress().get("running"):
+                break
+            _time.sleep(0.05)
+        server._unsubscribe(q)
+        while not q.empty():
+            events.append(q.get_nowait())
+        kinds = [e.get("phase") for e in events if e.get("type") == "workspace-prs"]
+        self.assertIn("done", kinds)
+        self.assertFalse(server.workspace_pr_progress()["running"])
+
+    def test_second_refresh_is_refused_while_one_runs(self):
+        server.WORKSPACE_PR_LOCK.acquire()
+        try:
+            out = server._refresh_workspace_prs_async(self.db)
+            self.assertFalse(out["started"])
+            self.assertEqual(out["reason"], "already-running")
+        finally:
+            server.WORKSPACE_PR_LOCK.release()
+
+    def test_status_is_readable_for_a_client_that_reconnects(self):
+        server._set_workspace_pr_progress(running=True, phase="repos", done=1, total=3)
+        st = server.workspace_pr_progress()
+        self.assertTrue(st["running"])
+        self.assertEqual(st["phase"], "repos")
+        server._set_workspace_pr_progress(running=False)
+
+
+class EveryWorkspaceSurfaceTests(unittest.TestCase):
+    """Each query that returns a workspace name must also return its path.
+
+    The label swap keys on `workspace_path`; a query that omits it silently
+    opts out of PR relabelling, which is invisible until someone notices a
+    stale directory name on one page.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.db = os.path.join(self.tmp, "w.db")
+        init_db(self.db)
+        from token_dashboard.db import connect
+        with connect(self.db) as c:
+            c.execute(
+                "INSERT INTO messages (uuid, session_id, project_slug, cwd, type, "
+                "timestamp, is_sidechain, model, input_tokens, output_tokens) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                ("m1", "s1", "-home-x-proj", "/home/x/proj", "assistant",
+                 "2026-05-01T00:00:00Z", 0, "claude-opus-5", 10, 5),
+            )
+            c.execute(
+                "INSERT INTO messages (uuid, session_id, project_slug, cwd, type, "
+                "timestamp, is_sidechain, model, input_tokens, output_tokens) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?)",
+                ("m2", "s1", "-home-x-proj", "/home/x/proj", "assistant",
+                 "2026-05-01T00:01:00Z", 1, "claude-sonnet-5", 20, 5),
+            )
+            c.commit()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_queries_that_name_a_workspace_also_carry_its_path(self):
+        from token_dashboard import db as D
+        checks = [
+            ("project_summary", D.project_summary(self.db), "project_name"),
+            ("recent_sessions", D.recent_sessions(self.db, limit=5), "project_name"),
+            ("top_subagent_sessions", D.top_subagent_sessions(self.db, limit=5), "project_name"),
+            ("dispatch_tree", D.dispatch_tree(self.db, limit=5), "project_name"),
+        ]
+        for name, rows, key in checks:
+            for r in rows:
+                if r.get(key):
+                    self.assertIn("workspace_path", r,
+                                  f"{name} rows name a workspace but carry no path")
+
+    def test_sdk_runs_carry_a_path_too(self):
+        from token_dashboard import db as D
+        for r in D.orchestration_breakdown(self.db).get("sdk_runs") or []:
+            if r.get("workspace"):
+                self.assertIn("workspace_path", r)
+
+
+class SankeyMergeTests(unittest.TestCase):
+    """Relabelling is many-to-one; ECharts Sankey throws on duplicate node names."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.db = os.path.join(self.tmp, "w.db")
+        init_db(self.db)
+        set_setting(self.db, server.WORKSPACE_PR_SETTING, "1")
+        # Two different directories, same PR — the real case: several
+        # worktrees created for one pull request.
+        save_workspace_prs(self.db, [
+            {"path": "/wt/a", "repo": "widgets", "repo_slug": "acme/widgets", "branch": "b",
+             "is_main": 0, "pr_number": 9, "pr_title": "Fix", "pr_url": "u",
+             "pr_state": "MERGED", "label": "widgets: #9 - Fix", "resolved": 1,
+             "inferred": 0, "checked_at": 1.0},
+            {"path": "/wt/b", "repo": "widgets", "repo_slug": "acme/widgets", "branch": "b",
+             "is_main": 0, "pr_number": 9, "pr_title": "Fix", "pr_url": "u",
+             "pr_state": "MERGED", "label": "widgets: #9 - Fix", "resolved": 1,
+             "inferred": 0, "checked_at": 1.0},
+        ])
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _matrix(self):
+        return {
+            "nodes": [
+                {"name": "a (agent)", "workspace_path": "/wt/a"},
+                {"name": "b (agent)", "workspace_path": "/wt/b"},
+                {"name": "z (files)", "workspace_path": "/wt/z"},
+            ],
+            "links": [
+                {"source": "a (agent)", "target": "z (files)", "value": 3},
+                {"source": "b (agent)", "target": "z (files)", "value": 4},
+            ],
+        }
+
+    def test_node_names_are_unique_after_relabelling(self):
+        out = server._apply_sankey_labels(self.db, self._matrix())
+        names = [n["name"] for n in out["nodes"]]
+        self.assertEqual(len(names), len(set(names)), f"duplicate node names: {names}")
+
+    def test_merged_nodes_keep_every_directory_they_stand_for(self):
+        out = server._apply_sankey_labels(self.db, self._matrix())
+        merged = [n for n in out["nodes"] if n["name"] == "widgets: #9 - Fix (agent)"][0]
+        self.assertEqual(sorted(merged["workspace_paths"]), ["/wt/a", "/wt/b"])
+
+    def test_links_into_a_merged_node_are_summed_not_duplicated(self):
+        out = server._apply_sankey_labels(self.db, self._matrix())
+        pairs = [(l["source"], l["target"]) for l in out["links"]]
+        self.assertEqual(len(pairs), len(set(pairs)), "duplicate link pairs")
+        self.assertEqual(out["links"][0]["value"], 7, "3 + 4 calls preserved")
+
+    def test_every_link_endpoint_still_names_a_node(self):
+        out = server._apply_sankey_labels(self.db, self._matrix())
+        names = {n["name"] for n in out["nodes"]}
+        for link in out["links"]:
+            self.assertIn(link["source"], names)
+            self.assertIn(link["target"], names)
+
+    def test_no_self_loops_are_introduced(self):
+        """Sankey needs a DAG; a node pointing at itself would crash it."""
+        out = server._apply_sankey_labels(self.db, self._matrix())
+        for link in out["links"]:
+            self.assertNotEqual(link["source"], link["target"])

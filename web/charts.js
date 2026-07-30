@@ -191,8 +191,10 @@ export function sankeyChart(el, { nodes, links, formatter, nodePaths }) {
         }
         // Workspace nodes show the directory they stand for — with PR labels on,
         // the node name no longer reveals where the work actually happened.
-        const path = nodePaths && nodePaths[p.name];
-        const where = path ? `<br/><span style="opacity:.7">${fmt.htmlSafe(path)}</span>` : '';
+        const paths = (nodePaths && nodePaths[p.name]) || [];
+        const shown = paths.slice(0, 3).map(x => fmt.htmlSafe(x)).join('<br/>');
+        const more = paths.length > 3 ? `<br/>+${paths.length - 3} more` : '';
+        const where = shown ? `<br/><span style="opacity:.7">${shown}${more}</span>` : '';
         return `<b>${fmt.htmlSafe(p.name)}</b><br/>${v}${where}`;
       },
     },

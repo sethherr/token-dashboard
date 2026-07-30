@@ -1,4 +1,26 @@
-import { api, state, $, fmt, cacheClear } from '/web/app.js';
+import { api, state, $, fmt, cacheClear, onServerEvent } from '/web/app.js';
+
+const WS_PR_PHASES = {
+  starting: 'Starting…',
+  inspect:  'Checking workspaces on disk',
+  repos:    'Fetching pull requests',
+  match:    'Matching branches to PRs',
+  done:     'Done',
+  error:    'Failed',
+};
+
+function wsPrProgressText(p) {
+  const phase = WS_PR_PHASES[p.phase] || p.phase || 'Working…';
+  if (!p.total) return phase + '…';
+  const pct = Math.min(100, Math.round((p.done / p.total) * 100));
+  const detail = p.phase === 'repos' && p.detail ? ` — ${p.detail}` : '';
+  return `${phase}: ${p.done}/${p.total} (${pct}%)${detail}`;
+}
+
+function wsPrPercent(p) {
+  if (!p.total) return 0;
+  return Math.min(100, Math.round((p.done / p.total) * 100));
+}
 
 function wsPrSummary(w) {
   if (!w || !w.enabled) return 'Off — workspaces show their directory name.';
@@ -61,6 +83,10 @@ export default async function (root) {
         <button id="ws-pr-refresh" ${wsPr.enabled ? '' : 'disabled'}>Refresh PR links</button>
         <span id="ws-pr-msg" class="muted">${fmt.htmlSafe(wsPrSummary(wsPr))}</span>
       </div>
+      <div id="ws-pr-progress" class="progress-track hidden" role="progressbar"
+           aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" aria-label="Refresh progress">
+        <div id="ws-pr-bar" class="progress-bar"></div>
+      </div>
       ${wsPr.gh_available ? '' : '<p class="muted" style="margin-top:8px;color:var(--warn)">The <code>gh</code> CLI was not found. Install it (<code>brew install gh</code>) and run <code>gh auth login</code> — without it, workspaces can still show <code>{repo}: {branch}</code> but never a PR number.</p>'}
       ${wsPr.git_available ? '' : '<p class="muted" style="margin-top:8px;color:var(--warn)">The <code>git</code> CLI was not found, so no workspace can be resolved.</p>'}
 
@@ -91,6 +117,22 @@ export default async function (root) {
 
   const wsPrMsg = $('#ws-pr-msg');
   const wsPrRefresh = $('#ws-pr-refresh');
+  const wsPrTrack = $('#ws-pr-progress');
+  const wsPrBar = $('#ws-pr-bar');
+
+  function showProgress(p) {
+    const pct = wsPrPercent(p);
+    wsPrTrack.classList.remove('hidden');
+    wsPrTrack.setAttribute('aria-valuenow', String(pct));
+    wsPrBar.style.width = pct + '%';
+    wsPrMsg.textContent = wsPrProgressText(p);
+    wsPrMsg.style.color = '';
+  }
+
+  function hideProgress() {
+    wsPrTrack.classList.add('hidden');
+    wsPrBar.style.width = '0%';
+  }
 
   function paintWsPr(status, note) {
     wsPr = status || wsPr;
@@ -99,9 +141,33 @@ export default async function (root) {
     wsPrMsg.style.color = '';
   }
 
-  async function postWsPr(url, payload) {
-    wsPrMsg.textContent = 'Querying git and gh…';
+  function finish(evt) {
+    hideProgress();
+    wsPrRefresh.disabled = !wsPr.enabled;
+    cacheClear();  // cached table payloads still carry the old labels
+    if (evt.error) {
+      wsPrMsg.textContent = 'Failed: ' + evt.error;
+      wsPrMsg.style.color = 'var(--bad)';
+      return;
+    }
+    const st = evt.stats || {};
+    const note = st.checked == null ? null
+      : `Linked ${st.with_pr} PR${st.with_pr === 1 ? '' : 's'} across ${st.resolved} of ${st.checked} workspaces`
+        + (st.live != null ? ` (${st.live} still on disk, ${st.inferred || 0} resolved from history).` : '.');
+    paintWsPr(evt.workspace_prs, note);
+  }
+
+  // Progress arrives over the shared SSE stream; the refresh POST only starts it.
+  const unsubscribe = onServerEvent(evt => {
+    if (evt.type !== 'workspace-prs') return;
+    if (!document.getElementById('ws-pr-msg')) { unsubscribe(); return; }  // route changed
+    if (evt.running) showProgress(evt);
+    else finish(evt);
+  });
+
+  async function startRefresh(url, payload) {
     wsPrRefresh.disabled = true;
+    showProgress({ phase: 'starting', done: 0, total: 0 });
     try {
       const r = await fetch(url, {
         method: 'POST',
@@ -109,13 +175,13 @@ export default async function (root) {
         body: JSON.stringify(payload),
       });
       const data = await r.json();
-      if (!r.ok) throw new Error(data.error || ('HTTP ' + r.status));
-      cacheClear();  // cached table payloads still carry the old labels
-      const note = data.checked == null ? null
-        : `Linked ${data.with_pr} PR${data.with_pr === 1 ? '' : 's'} across ${data.resolved} of ${data.checked} workspaces`
-          + (data.live != null ? ` (${data.live} still on disk, ${data.inferred || 0} resolved from history).` : '.');
-      paintWsPr(data.workspace_prs, note);
+      if (!r.ok && r.status !== 409) throw new Error(data.error || ('HTTP ' + r.status));
+      if (data.workspace_prs) wsPr = data.workspace_prs;
+      if (data.started === false) {
+        wsPrMsg.textContent = 'A refresh is already running…';
+      }
     } catch (e) {
+      hideProgress();
       wsPrRefresh.disabled = !wsPr.enabled;
       wsPrMsg.textContent = 'Failed: ' + e.message;
       wsPrMsg.style.color = 'var(--bad)';
@@ -123,10 +189,24 @@ export default async function (root) {
   }
 
   $('#ws-pr-toggle').addEventListener('change', e => {
-    postWsPr('/api/workspace-prs', { enabled: e.target.checked });
+    const enabled = e.target.checked;
+    if (!enabled) {
+      hideProgress();
+      fetch('/api/workspace-prs', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled: false }),
+      }).then(r => r.json()).then(d => { cacheClear(); paintWsPr(d.workspace_prs); });
+      return;
+    }
+    startRefresh('/api/workspace-prs', { enabled: true });
   });
 
-  wsPrRefresh.addEventListener('click', () => postWsPr('/api/workspace-prs/refresh', {}));
+  wsPrRefresh.addEventListener('click', () => startRefresh('/api/workspace-prs/refresh', {}));
+
+  // Reconnecting mid-run (or navigating back to Settings) should show progress.
+  api('/api/workspace-prs/status').then(st => {
+    if (st.running) { wsPrRefresh.disabled = true; showProgress(st); }
+  }).catch(() => {});
 
   $('#save').addEventListener('click', async () => {
     const plan = $('#plan').value;

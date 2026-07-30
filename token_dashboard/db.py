@@ -982,7 +982,17 @@ def session_turns(db_path, session_id: str) -> list:
        ORDER BY timestamp ASC
     """
     with connect(db_path) as c:
-        return [dict(r) for r in c.execute(sql, (session_id,))]
+        rows = [dict(r) for r in c.execute(sql, (session_id,))]
+        # Carry the workspace name + root path so the session-detail header can
+        # be relabelled like every other workspace surface. Cheap: one lookup
+        # per distinct slug, and a session is almost always a single slug.
+        cache: dict = {}
+        for r in rows:
+            slug = r.get("project_slug") or ""
+            if not slug:
+                continue
+            r["project_name"], r["workspace_path"] = _slug_workspace(c, slug, cache)
+        return rows
 
 
 def daily_token_breakdown(db_path, since=None, until=None) -> list:

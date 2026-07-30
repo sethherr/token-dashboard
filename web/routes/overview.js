@@ -1,4 +1,4 @@
-import { api, fmt, state, cacheGet, cacheSet } from '/web/app.js';
+import { api, fmt, state, cacheGet, cacheSet, workspaceLabel, bindWorkspaceTooltips } from '/web/app.js';
 import { barChart, donutChart, groupedBarChart, stackedBarChart } from '/web/charts.js';
 
 const RANGES = [
@@ -132,9 +132,9 @@ function renderBundle(root, { totals, projects, sessions, tools, daily, byModel 
           <thead><tr><th>started</th><th>project</th><th class="num">tokens</th></tr></thead>
           <tbody>
             ${sessions.map(s => `
-              <tr>
+              <tr class="clickable" data-session="${fmt.htmlSafe(s.session_id)}">
                 <td class="mono">${fmt.ts(s.started)}</td>
-                <td><a href="#/sessions/${encodeURIComponent(s.session_id)}" class="blur-sensitive">${fmt.htmlSafe(s.project_name || s.project_slug)}</a></td>
+                <td class="blur-sensitive">${workspaceLabel(s.project_name || s.project_slug, s.workspace_path, { prNumber: s.pr_number, prUrl: s.pr_url })}</td>
                 <td class="num">${fmt.compact(s.tokens)}</td>
               </tr>`).join('') || '<tr><td colspan="3" class="muted">no sessions in this range</td></tr>'}
           </tbody>
@@ -189,6 +189,17 @@ function renderBundle(root, { totals, projects, sessions, tools, daily, byModel 
     values: topTools.map(t => t.calls),
     color: '#7C5CFF',
   });
+
+  // The project cell used to be the link to the session; it now holds the
+  // workspace label (which may contain its own PR link), so the row navigates.
+  root.querySelectorAll('tr.clickable').forEach(tr => {
+    tr.style.cursor = 'pointer';
+    tr.addEventListener('click', e => {
+      if (e.target.closest('a, .ws-info')) return;  // let links + the ? icon win
+      location.hash = '#/sessions/' + tr.dataset.session;
+    });
+  });
+  bindWorkspaceTooltips(root);
 }
 
 function planSubtitle() {

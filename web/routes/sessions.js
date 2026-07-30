@@ -334,7 +334,11 @@ function buildSession(root, id, turns, initFilter, initCol, initDir) {
   const slug    = (turns[0] && turns[0].project_slug) || '';
   const cwd     = (turns.find(t => t.cwd) || {}).cwd || '';
   const base    = cwd ? cwd.replace(/\\/g, '/').replace(/\/+$/, '').split('/').pop() : '';
-  const project = base || slug;
+  // project_name is server-decorated (PR label when the setting is on); the
+  // cwd basename is only a fallback for rows that predate that.
+  const head    = turns.find(t => t.project_name) || {};
+  const project = head.project_name || base || slug;
+  const wsPath  = head.workspace_path || cwd;
   const started = (turns[0] && turns[0].timestamp) || '';
   const ended   = (turns[turns.length - 1] && turns[turns.length - 1].timestamp) || '';
 
@@ -359,7 +363,7 @@ function buildSession(root, id, turns, initFilter, initCol, initDir) {
         <a href="#/sessions" class="muted" style="white-space:nowrap">← all sessions</a>
       </h2>
       <div class="flex muted" style="font-family:var(--mono);font-size:12px;flex-wrap:wrap;gap:14px">
-        <span class="blur-sensitive">${fmt.htmlSafe(project)}</span>
+        <span class="blur-sensitive">${workspaceLabel(project, wsPath, { prNumber: head.pr_number, prUrl: head.pr_url })}</span>
         <span>${fmt.ts(started)} → ${fmt.ts(ended)}</span>
         <span>${turns.length} records</span>
         <span>${fmt.int(totalIn)} in · ${fmt.int(totalOut)} out · ${fmt.int(totalCacheRd)} cache rd</span>
@@ -460,4 +464,6 @@ function buildSession(root, id, turns, initFilter, initCol, initDir) {
       writeState();
     },
   });
+
+  bindWorkspaceTooltips(root);
 }

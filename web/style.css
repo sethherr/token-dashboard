@@ -473,3 +473,23 @@ hr.divider { border: 0; border-top: 1px solid var(--border); margin: 16px 0; }
 .ws-info:hover::after,
 .ws-info:focus-visible::after,
 .ws-info.ws-open::after { opacity: 1; visibility: visible; }
+
+/* Determinate progress bar (workspace→PR refresh, ~a minute of network calls). */
+.progress-track.hidden { display: none; }
+.progress-track {
+  margin: 10px 0 2px;
+  width: 100%;
+  max-width: 520px;
+  height: 6px;
+  border-radius: 3px;
+  background: var(--panel-2);
+  border: 1px solid var(--border-2);
+  overflow: hidden;
+}
+.progress-bar {
+  height: 100%;
+  width: 0;
+  border-radius: 3px;
+  background: linear-gradient(90deg, var(--accent), var(--accent-2));
+  transition: width 180ms ease-out;
+}

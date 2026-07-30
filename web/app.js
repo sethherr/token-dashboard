@@ -141,16 +141,30 @@ export function bindWorkspaceTooltips(root = document) {
       document.querySelectorAll('.ws-info.ws-open').forEach(o => o.classList.remove('ws-open'));
       if (!open) el.classList.add('ws-open');
     });
-    el.addEventListener('keydown', e => {
-      if (e.key === 'Escape') el.classList.remove('ws-open');
-    });
   });
   if (!document.body.dataset.wsDismissBound) {
     document.body.dataset.wsDismissBound = '1';
-    document.addEventListener('click', () => {
+    const closeAll = () =>
       document.querySelectorAll('.ws-info.ws-open').forEach(o => o.classList.remove('ws-open'));
+    document.addEventListener('click', closeAll);
+    // Escape closes it wherever focus happens to be — clicking the icon does
+    // not reliably focus it (Safari doesn't focus buttons on click), so a
+    // key handler bound to the button alone would miss most of the time.
+    document.addEventListener('keydown', e => {
+      if (e.key === 'Escape') closeAll();
     });
   }
+}
+
+// ── Server event subscription ────────────────────────────────────────────────
+// Routes that care about long-running server work (the workspace→PR refresh)
+// subscribe here rather than opening a second EventSource.
+const _serverEventSubs = new Set();
+
+/** Subscribe to /api/stream events. Returns an unsubscribe function. */
+export function onServerEvent(fn) {
+  _serverEventSubs.add(fn);
+  return () => _serverEventSubs.delete(fn);
 }
 
 // ── Refresh / countdown state ─────────────────────────────────────────────────
@@ -432,6 +446,7 @@ async function boot() {
     es.onmessage = ev => {
       try {
         const evt = JSON.parse(ev.data);
+        _serverEventSubs.forEach(fn => { try { fn(evt); } catch {} });
         if (evt.type === 'scan') {
           _nextScanAt = Date.now() + SCAN_INTERVAL;
           // Only flag new data + invalidate cache when the scan actually

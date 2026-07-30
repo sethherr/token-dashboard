@@ -108,8 +108,11 @@ export default async function (root) {
   bindWorkspaceTooltips(root);
 
   if (matrix.links.length > 0) {
-    const nodePaths = Object.fromEntries(
-      (matrix.nodes || []).filter(n => n.workspace_path).map(n => [n.name, n.workspace_path]));
+    // A PR label can cover several directories (multiple worktrees, one PR),
+    // so a node may stand for more than one path.
+    const nodePaths = Object.fromEntries((matrix.nodes || [])
+      .map(n => [n.name, n.workspace_paths || (n.workspace_path ? [n.workspace_path] : [])])
+      .filter(([, paths]) => paths.length));
     sankeyChart(document.getElementById('ch-workspaces'), {
       nodes: matrix.nodes,
       links: matrix.links,
