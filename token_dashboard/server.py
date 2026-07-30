@@ -8,6 +8,7 @@ import mimetypes
 import os
 import queue
 import shutil
+import sys
 import subprocess
 import threading
 import time
@@ -1081,6 +1082,26 @@ def _scan_loop(db_path: str, projects_dir: Optional[str] = None, interval: float
         time.sleep(interval)
 
 
+class QuietThreadingHTTPServer(http.server.ThreadingHTTPServer):
+    """A server that doesn't dump a traceback every time a client hangs up.
+
+    Browsers reset keep-alive and speculative connections routinely, and the
+    SSE stream is dropped on every page navigation and reload. socketserver's
+    default ``handle_error`` prints a full traceback for each one — dozens of
+    them in normal use — which buries anything that actually matters.
+
+    Only connection-level errors are swallowed; everything else still prints.
+    """
+
+    def handle_error(self, request, client_address):
+        exc = sys.exc_info()[1]
+        # ConnectionError covers reset/aborted/broken-pipe; TimeoutError is an
+        # idle keep-alive socket expiring. Neither is actionable.
+        if isinstance(exc, (ConnectionError, TimeoutError)):
+            return
+        super().handle_error(request, client_address)
+
+
 def run(host: str, port: int, db_path: str, projects_dir: Optional[str] = None):
     pricing = load_pricing(PRICING_JSON)
     # Warm the default range (30d) synchronously before opening the port so
@@ -1094,5 +1115,5 @@ def run(host: str, port: int, db_path: str, projects_dir: Optional[str] = None):
     threading.Thread(target=_warm_rest, daemon=True).start()
     threading.Thread(target=_scan_loop, args=(db_path, projects_dir), daemon=True).start()
     H = build_handler(db_path, projects_dir)
-    httpd = http.server.ThreadingHTTPServer((host, port), H)
+    httpd = QuietThreadingHTTPServer((host, port), H)
     httpd.serve_forever()
