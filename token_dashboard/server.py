@@ -7,6 +7,7 @@ import json
 import mimetypes
 import os
 import queue
+import shutil
 import subprocess
 import threading
 import time
@@ -198,24 +199,80 @@ def _empty_rtk_payload(available: bool) -> dict:
     }
 
 
-def _rtk_payload(home=None) -> dict:
+RTK_ENV_VAR = "TOKEN_DASHBOARD_RTK_BIN"
+
+# Searched in order after PATH, since a dashboard launched from a GUI/launchd
+# context often inherits a minimal PATH that omits Homebrew and Cargo.
+_RTK_FALLBACK_DIRS = (
+    ("~", ".local", "bin"),
+    ("~", ".cargo", "bin"),
+    ("/opt", "homebrew", "bin"),
+    ("/usr", "local", "bin"),
+)
+
+
+def _rtk_fallback_paths(home_path: Path) -> list:
+    out = []
+    for parts in _RTK_FALLBACK_DIRS:
+        base = home_path.joinpath(*parts[1:]) if parts[0] == "~" else Path(*parts)
+        out.append(base / "rtk")
+        out.append(base / "rtk.exe")  # Windows
+    return out
+
+
+def _find_rtk(home=None, env=None) -> Optional[str]:
+    """Locate the ``rtk`` binary, or None if it isn't installed.
+
+    Resolution order: the ``TOKEN_DASHBOARD_RTK_BIN`` override, then ``PATH``,
+    then a handful of common install dirs. RTK is not installed to a single
+    canonical location — Homebrew, Cargo, and the install script each put it
+    somewhere different — so probing one hardcoded path misses most setups.
+    """
+    env = os.environ if env is None else env
     home_path = Path(home) if home is not None else Path.home()
-    rtk_bin = str(home_path / ".local" / "bin" / "rtk")
-    if not Path(rtk_bin).is_file():
+
+    override = env.get(RTK_ENV_VAR)
+    if override:
+        # An explicit override is honoured as given: if it's wrong, the RTK tab
+        # should report "not installed" rather than silently use a different binary.
+        return override if os.access(override, os.X_OK) and Path(override).is_file() else None
+
+    # Pass PATH explicitly (defaulting to empty, not None) so a caller-supplied
+    # env without PATH searches nothing rather than falling back to os.defpath.
+    found = shutil.which("rtk", path=env.get("PATH", ""))
+    if found:
+        return found
+
+    for cand in _rtk_fallback_paths(home_path):
+        if cand.is_file() and os.access(str(cand), os.X_OK):
+            return str(cand)
+    return None
+
+
+def _rtk_payload(home=None, env=None) -> dict:
+    rtk_bin = _find_rtk(home=home, env=env)
+    if not rtk_bin:
         return _empty_rtk_payload(False)
-    env = dict(os.environ)
-    env["PATH"] = str(home_path / ".local" / "bin") + ":" + env.get("PATH", "")
+    run_env = dict(os.environ if env is None else env)
+    # Make sure the resolved binary's own directory is reachable, in case rtk
+    # shells out to siblings.
+    parent = str(Path(rtk_bin).parent)
+    if parent not in run_env.get("PATH", "").split(os.pathsep):
+        run_env["PATH"] = parent + os.pathsep + run_env.get("PATH", "")
     try:
         r = subprocess.run(
             [rtk_bin, "gain", "--format", "json", "--all"],
-            capture_output=True, text=True, timeout=10, env=env,
+            capture_output=True, text=True, timeout=10, env=run_env,
         )
         if r.returncode == 0 and r.stdout.strip():
             data = json.loads(r.stdout)
-            data["available"] = True
-            data["install_url"] = "https://github.com/rtk-ai/rtk"
-            return data
-    except (FileNotFoundError, subprocess.TimeoutExpired, json.JSONDecodeError):
+            # A different tool also ships as `rtk` (Rust Type Kit); it can exit 0
+            # with output that isn't the gain report, so don't trust the shape.
+            if isinstance(data, dict):
+                data["available"] = True
+                data["install_url"] = "https://github.com/rtk-ai/rtk"
+                return data
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
         pass
     return _empty_rtk_payload(True)
 
