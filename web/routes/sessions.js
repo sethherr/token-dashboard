@@ -97,6 +97,7 @@ function buildList(root, list, qs) {
   // A custom from/to range takes precedence over the quick-period tabs.
   const state = {
     project:   qs.get('project') || '',
+    repo:      qs.get('repo') || '',
     q:         qs.get('q') || '',
     period:    PERIODS.some(p => p.key === qs.get('period')) ? qs.get('period') : 'all',
     from:      qs.get('from') || '',
@@ -111,6 +112,11 @@ function buildList(root, list, qs) {
     .sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()));
   const projectSet = new Set(projects.map(p => p.toLowerCase()));
 
+  // Repositories come from the workspace→PR association, so the selector is
+  // empty until that setting is on and a refresh has run.
+  const repos = [...new Set(list.map(s => s.repo).filter(Boolean))]
+    .sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()));
+
   root.innerHTML = `
     <div class="card">
       <div class="flex" style="margin-bottom:14px;flex-wrap:wrap;gap:10px;align-items:center">
@@ -121,6 +127,11 @@ function buildList(root, list, qs) {
         </div>
       </div>
       <div class="flex" style="margin-bottom:10px;flex-wrap:wrap;gap:10px;align-items:center">
+        <select id="f-repo" style="min-width:150px" ${repos.length ? '' : 'disabled'}
+          title="${repos.length ? 'Filter by repository' : 'Turn on “Associate workspaces with GitHub PRs” in Settings to filter by repository'}">
+          <option value="">${repos.length ? 'all repositories' : 'no repositories'}</option>
+          ${repos.map(r => `<option value="${fmt.htmlSafe(r)}" ${r === state.repo ? 'selected' : ''}>${fmt.htmlSafe(r)}</option>`).join('')}
+        </select>
         <span class="ac" style="min-width:170px"><input id="f-project" autocomplete="off" placeholder="all projects…" value="${fmt.htmlSafe(state.project)}" style="width:100%" title="Filter by project — type to autocomplete, or pick from the list"></span>
         <span class="ac" style="flex:1;min-width:180px"><input id="f-search" type="search" autocomplete="off" placeholder="search project or session…" value="${fmt.htmlSafe(state.q)}" style="width:100%" title="Substring match on project name or session id"></span>
         <input id="f-mincost" type="number" min="0" step="0.5" placeholder="min $" value="${fmt.htmlSafe(state.minCost)}" style="width:90px" title="Minimum cost (USD)">
@@ -142,7 +153,7 @@ function buildList(root, list, qs) {
           ${list.map(s => {
             const proj = s.project_name || s.project_slug || '';
             return `
-            <tr data-project="${fmt.htmlSafe(proj)}" data-started="${s.started || ''}" data-turns="${s.turns || 0}" data-tokens="${s.tokens || 0}" data-cost="${s.cost_usd ?? ''}" data-cost-est="${s.cost_estimated ? '1' : ''}" data-session="${fmt.htmlSafe(s.session_id || '')}">
+            <tr data-project="${fmt.htmlSafe(proj)}" data-repo="${fmt.htmlSafe(s.repo || '')}" data-started="${s.started || ''}" data-turns="${s.turns || 0}" data-tokens="${s.tokens || 0}" data-cost="${s.cost_usd ?? ''}" data-cost-est="${s.cost_estimated ? '1' : ''}" data-session="${fmt.htmlSafe(s.session_id || '')}">
               <td class="mono" data-val="${s.started || ''}">${fmt.ts(s.started)}</td>
               <td class="blur-sensitive" data-val="${fmt.htmlSafe(proj)}">${workspaceLabel(proj, s.workspace_path, { prNumber: s.pr_number, prUrl: s.pr_url })}</td>
               <td class="num" data-val="${s.turns || 0}">${fmt.int(s.turns)}</td>
@@ -172,6 +183,7 @@ function buildList(root, list, qs) {
   // ── URL persistence ──────────────────────────────────────────────────────
   function writeState(col, dir) {
     const p = new URLSearchParams();
+    if (state.repo)      p.set('repo', state.repo);
     if (state.project)   p.set('project', state.project);
     if (state.q)         p.set('q', state.q);
     if (state.from)      p.set('from', state.from);
@@ -214,6 +226,7 @@ function buildList(root, list, qs) {
 
     for (const tr of rows) {
       const proj    = tr.dataset.project || '';
+      const repo    = tr.dataset.repo || '';
       const started = tr.dataset.started || '';
       const tokens  = Number(tr.dataset.tokens || 0);
       const turns   = Number(tr.dataset.turns || 0);
@@ -221,13 +234,14 @@ function buildList(root, list, qs) {
       const session = tr.dataset.session || '';
 
       const t = started ? new Date(started).getTime() : NaN;
+      const okRepo    = !state.repo || repo === state.repo;
       const okProject = !pf || (pfExact ? proj.toLowerCase() === pf : proj.toLowerCase().includes(pf));
       const okSearch  = !needle || proj.toLowerCase().includes(needle) || session.toLowerCase().includes(needle);
       const okPeriod  = (minMs === -Infinity && maxMs === Infinity) || (!Number.isNaN(t) && t >= minMs && t <= maxMs);
       const okCost    = minCost == null || (cost != null && cost >= minCost);
       const okTokens  = minTok == null || tokens >= minTok;
 
-      const show = okProject && okSearch && okPeriod && okCost && okTokens;
+      const show = okRepo && okProject && okSearch && okPeriod && okCost && okTokens;
       tr.style.display = show ? '' : 'none';
       if (show) {
         visible++;
@@ -248,6 +262,10 @@ function buildList(root, list, qs) {
   // Text/number inputs run through a debounce so typing stays smooth even with
   // hundreds of rows; selecting a datalist suggestion also fires 'input'.
   const refresh = debounce(() => { applyFilters(); writeState(lastCol, lastDir); }, 150);
+  el('#f-repo').addEventListener('change', e => {
+    state.repo = e.target.value;
+    applyFilters(); writeState(lastCol, lastDir);
+  });
   el('#f-project').addEventListener('input', e => { state.project = e.target.value; refresh(); });
   el('#f-search').addEventListener('input', e => { state.q = e.target.value; refresh(); });
   el('#f-mincost').addEventListener('input', e => { state.minCost = e.target.value; refresh(); });
@@ -283,7 +301,8 @@ function buildList(root, list, qs) {
   }
 
   el('#f-clear').addEventListener('click', () => {
-    Object.assign(state, { project: '', q: '', period: 'all', from: '', to: '', minCost: '', minTokens: '' });
+    Object.assign(state, { repo: '', project: '', q: '', period: 'all', from: '', to: '', minCost: '', minTokens: '' });
+    el('#f-repo').value = '';
     el('#f-project').value = '';
     el('#f-search').value = '';
     el('#f-mincost').value = '';
