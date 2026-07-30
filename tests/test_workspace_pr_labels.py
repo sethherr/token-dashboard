@@ -647,3 +647,53 @@ class TopUpMustNotDegradeTests(unittest.TestCase):
 
         server._top_up_workspace_prs(self.db, resolver=resolver, now=1e9)
         self.assertEqual(workspace_pr_map(self.db)["/ws/repo/dead"]["pr_number"], 42)
+
+
+class StatusBreakdownTests(unittest.TestCase):
+    """The status payload carries what a finished refresh reports, so the
+    Settings panel describes the same state the same way on page load."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.db = os.path.join(self.tmp, "w.db")
+        init_db(self.db)
+        set_setting(self.db, server.WORKSPACE_PR_SETTING, "1")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _row(self, path, **kw):
+        base = {"path": path, "repo": "widgets", "repo_slug": "acme/widgets",
+                "branch": "b", "is_main": 0, "pr_number": None, "pr_title": None,
+                "pr_url": None, "pr_state": None, "label": "widgets: b",
+                "resolved": 1, "inferred": 0, "checked_at": 100.0}
+        base.update(kw)
+        return base
+
+    def test_counts_split_live_from_inferred(self):
+        save_workspace_prs(self.db, [
+            self._row("/live", inferred=0, pr_number=1),
+            self._row("/dead1", inferred=1, pr_number=2),
+            self._row("/dead2", inferred=1),
+            self._row("/gone", resolved=0, inferred=0, label=None),
+        ])
+        st = server._workspace_pr_status(self.db)
+        self.assertEqual(st["checked"], 4)     # every path examined
+        self.assertEqual(st["linked"], 3)      # three carry a label
+        self.assertEqual(st["with_pr"], 2)
+        self.assertEqual(st["on_disk"], 1)
+        self.assertEqual(st["inferred"], 2)
+        self.assertEqual(st["on_disk"] + st["inferred"], st["linked"])
+
+    def test_last_checked_is_the_newest_row(self):
+        save_workspace_prs(self.db, [
+            self._row("/a", checked_at=100.0),
+            self._row("/b", checked_at=500.0),
+        ])
+        self.assertEqual(server._workspace_pr_status(self.db)["last_checked"], 500.0)
+
+    def test_empty_table_reports_zeroes_not_none(self):
+        st = server._workspace_pr_status(self.db)
+        for k in ("checked", "linked", "with_pr", "on_disk", "inferred"):
+            self.assertEqual(st[k], 0, k)
+        self.assertIsNone(st["last_checked"])

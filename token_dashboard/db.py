@@ -730,6 +730,31 @@ def workspace_paths_needing_pr_refresh(db_path, recheck_before: float = 0.0) -> 
     return out
 
 
+def workspace_pr_counts(db_path) -> dict:
+    """How the cached association breaks down.
+
+    ``on_disk`` are workspaces resolved by running git in a directory that
+    still exists; ``inferred`` were reconstructed from the transcripts after
+    the worktree was deleted. Together they are the labelled total.
+    """
+    out = {"checked": 0, "on_disk": 0, "inferred": 0}
+    with connect(db_path) as c:
+        try:
+            row = c.execute(
+                "SELECT COUNT(*) AS checked, "
+                "  SUM(CASE WHEN resolved=1 AND inferred=0 THEN 1 ELSE 0 END) AS on_disk, "
+                "  SUM(CASE WHEN inferred=1 THEN 1 ELSE 0 END) AS inferred "
+                "FROM workspace_prs"
+            ).fetchone()
+        except sqlite3.OperationalError:
+            return out  # table predates this feature
+    if row:
+        out["checked"] = row["checked"] or 0
+        out["on_disk"] = row["on_disk"] or 0
+        out["inferred"] = row["inferred"] or 0
+    return out
+
+
 def clear_workspace_prs(db_path) -> None:
     with connect(db_path) as c:
         c.execute("DELETE FROM workspace_prs")

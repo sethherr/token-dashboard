@@ -22,11 +22,21 @@ function wsPrPercent(p) {
   return Math.min(100, Math.round((p.done / p.total) * 100));
 }
 
+// One sentence for both cases — freshly finished and seen on page load — so
+// the panel doesn't say two different things about the same state.
 function wsPrSummary(w) {
   if (!w || !w.enabled) return 'Off — workspaces show their directory name.';
   if (!w.linked) return 'On, but nothing linked yet. Click "Refresh PR links".';
-  const when = w.last_checked ? new Date(w.last_checked * 1000).toLocaleString('sv').slice(0, 16) : 'unknown';
-  return `${w.with_pr} PR${w.with_pr === 1 ? '' : 's'} linked across ${w.linked} workspace${w.linked === 1 ? '' : 's'} — last checked ${when}.`;
+  const s = n => (n === 1 ? '' : 's');
+  let out = `Linked ${w.with_pr} PR${s(w.with_pr)} across ${w.linked}`
+    + (w.checked ? ` of ${w.checked}` : '') + ` workspace${s(w.linked)}`;
+  if (w.on_disk != null && w.inferred != null) {
+    out += ` (${w.on_disk} still on disk, ${w.inferred} resolved from history)`;
+  }
+  if (w.last_checked) {
+    out += ` — last checked ${new Date(w.last_checked * 1000).toLocaleString('sv').slice(0, 16)}`;
+  }
+  return out;
 }
 
 export default async function (root) {
@@ -150,11 +160,7 @@ export default async function (root) {
       wsPrMsg.style.color = 'var(--bad)';
       return;
     }
-    const st = evt.stats || {};
-    const note = st.checked == null ? null
-      : `Linked ${st.with_pr} PR${st.with_pr === 1 ? '' : 's'} across ${st.resolved} of ${st.checked} workspaces`
-        + (st.live != null ? ` (${st.live} still on disk, ${st.inferred || 0} resolved from history).` : '.');
-    paintWsPr(evt.workspace_prs, note);
+    paintWsPr(evt.workspace_prs);
   }
 
   // Progress arrives over the shared SSE stream; the refresh POST only starts it.

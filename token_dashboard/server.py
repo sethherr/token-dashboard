@@ -20,7 +20,7 @@ from . import pr_links
 from .db import (
     clear_scan_data, default_claude_dir, get_setting, set_setting,
     workspace_pr_map, save_workspace_prs, workspace_root_paths, clear_workspace_prs,
-    workspace_branches, workspace_paths_needing_pr_refresh,
+    workspace_branches, workspace_paths_needing_pr_refresh, workspace_pr_counts,
     overview_totals, expensive_prompts, project_summary,
     tool_token_breakdown, recent_sessions, session_turns,
     session_model_tokens,
@@ -673,13 +673,22 @@ def workspace_pr_links_enabled(db_path: str) -> bool:
 
 
 def _workspace_pr_status(db_path: str) -> dict:
+    """Everything the Settings panel needs to describe the current association.
+
+    Carries the same counts a just-finished refresh reports, so the panel can
+    say one thing whether you have just run it or are seeing it on page load.
+    """
     rows = workspace_pr_map(db_path)
-    checked = [r.get("checked_at") for r in rows.values() if r.get("checked_at")]
+    counts = workspace_pr_counts(db_path)
+    checked_at = [r.get("checked_at") for r in rows.values() if r.get("checked_at")]
     return {
         "enabled": workspace_pr_links_enabled(db_path),
         "linked": len(rows),
         "with_pr": sum(1 for r in rows.values() if r.get("pr_number")),
-        "last_checked": max(checked) if checked else None,
+        "checked": counts["checked"],
+        "on_disk": counts["on_disk"],
+        "inferred": counts["inferred"],
+        "last_checked": max(checked_at) if checked_at else None,
         "gh_available": bool(pr_links.find_gh()),
         "git_available": bool(pr_links.find_git()),
     }
