@@ -1,4 +1,4 @@
-import { api, fmt } from '/web/app.js';
+import { api, fmt, workspaceLabel, bindWorkspaceTooltips } from '/web/app.js';
 import { sankeyChart } from '/web/charts.js';
 
 const RANGES = [
@@ -88,9 +88,9 @@ export default async function (root) {
         <tbody>
           ${leaks.length === 0 ? '<tr><td colspan="6" class="muted">no cross-workspace activity in this range</td></tr>' : leaks.map(l => `
             <tr>
-              <td><span class="badge blur-sensitive">${fmt.htmlSafe(l.source)}</span></td>
+              <td>${workspaceLabel(l.source, l.source_path, { className: 'blur-sensitive', prNumber: l.source_pr_number, prUrl: l.source_pr_url })}</td>
               <td class="muted">→</td>
-              <td><span class="badge blur-sensitive">${fmt.htmlSafe(l.target)}</span></td>
+              <td>${workspaceLabel(l.target, l.target_path, { className: 'blur-sensitive', prNumber: l.target_pr_number, prUrl: l.target_pr_url })}</td>
               <td class="num">${fmt.int(l.calls)}</td>
               <td class="num">${fmt.int(l.sessions)}</td>
               <td class="mono" style="font-size:11px">
@@ -105,12 +105,19 @@ export default async function (root) {
   root.querySelectorAll('.range-tabs button').forEach(btn => {
     btn.addEventListener('click', () => writeRange(btn.dataset.range));
   });
+  bindWorkspaceTooltips(root);
 
   if (matrix.links.length > 0) {
+    // A PR label can cover several directories (multiple worktrees, one PR),
+    // so a node may stand for more than one path.
+    const nodePaths = Object.fromEntries((matrix.nodes || [])
+      .map(n => [n.name, n.workspace_paths || (n.workspace_path ? [n.workspace_path] : [])])
+      .filter(([, paths]) => paths.length));
     sankeyChart(document.getElementById('ch-workspaces'), {
       nodes: matrix.nodes,
       links: matrix.links,
       formatter: v => Number(v).toLocaleString() + ' calls',
+      nodePaths,
     });
   } else {
     document.getElementById('ch-workspaces').innerHTML = '<p class="muted" style="padding:40px;text-align:center">No file-touching activity in this range.</p>';

@@ -92,6 +92,81 @@ export function cacheGet(key) {
 export function cacheSet(key, data) { _cache.set(key, { data, ts: Date.now() }); }
 export function cacheClear()        { _cache.clear(); }
 
+// ── Workspace labels ──────────────────────────────────────────────────────────
+// A workspace is a directory an agent ran in. With PR association on, the
+// display name becomes "{repo}: #123 - title", which says nothing about where
+// the work happened — so every workspace name gets a "?" affordance showing
+// its path, on hover and on click, whether or not it resolved to a PR.
+
+const GITHUB_PR_URL = /^https:\/\/github\.com\/[^/]+\/[^/]+\/pull\/\d+$/;
+
+/**
+ * Markup for a workspace name plus its path affordance.
+ * @param {string} name   display name (already PR-labelled server-side, or the directory name)
+ * @param {string} path   workspace directory, shown in the tooltip
+ * @param {object} opts   {className, prNumber, prUrl}
+ */
+export function workspaceLabel(name, path, { className = '', prNumber, prUrl } = {}) {
+  let label = fmt.htmlSafe(name ?? '');
+
+  // Turn the "#123" the server put in the label into a link to the PR. Done
+  // after escaping and against the literal token, so a hostile PR title can't
+  // introduce markup — and only for a real github.com pull URL.
+  if (prNumber && prUrl && GITHUB_PR_URL.test(prUrl)) {
+    const token = '#' + prNumber;
+    const at = label.indexOf(token);
+    if (at !== -1) {
+      const anchor = `<a href="${fmt.htmlSafe(prUrl)}" target="_blank" rel="noopener noreferrer"`
+        + ` class="ws-pr" title="Open pull request #${prNumber} on GitHub">${token}</a>`;
+      label = label.slice(0, at) + anchor + label.slice(at + token.length);
+    }
+  }
+
+  if (!path) return `<span class="ws-cell ${className}">${label}</span>`;
+  const safePath = fmt.htmlSafe(path);
+  return `<span class="ws-cell ${className}"><span class="ws-name">${label}</span>`
+    + `<button type="button" class="ws-info" data-ws-path="${safePath}"`
+    + ` aria-label="Workspace path: ${safePath}">?</button></span>`;
+}
+
+/** Click-to-pin for the path tooltip. Hover is pure CSS. */
+export function bindWorkspaceTooltips(root = document) {
+  root.querySelectorAll('.ws-info[data-ws-path]').forEach(el => {
+    if (el.dataset.wsBound) return;
+    el.dataset.wsBound = '1';
+    el.addEventListener('click', e => {
+      e.stopPropagation();
+      e.preventDefault();
+      const open = el.classList.contains('ws-open');
+      document.querySelectorAll('.ws-info.ws-open').forEach(o => o.classList.remove('ws-open'));
+      if (!open) el.classList.add('ws-open');
+    });
+  });
+  if (!document.body.dataset.wsDismissBound) {
+    document.body.dataset.wsDismissBound = '1';
+    const closeAll = () =>
+      document.querySelectorAll('.ws-info.ws-open').forEach(o => o.classList.remove('ws-open'));
+    document.addEventListener('click', closeAll);
+    // Escape closes it wherever focus happens to be — clicking the icon does
+    // not reliably focus it (Safari doesn't focus buttons on click), so a
+    // key handler bound to the button alone would miss most of the time.
+    document.addEventListener('keydown', e => {
+      if (e.key === 'Escape') closeAll();
+    });
+  }
+}
+
+// ── Server event subscription ────────────────────────────────────────────────
+// Routes that care about long-running server work (the workspace→PR refresh)
+// subscribe here rather than opening a second EventSource.
+const _serverEventSubs = new Set();
+
+/** Subscribe to /api/stream events. Returns an unsubscribe function. */
+export function onServerEvent(fn) {
+  _serverEventSubs.add(fn);
+  return () => _serverEventSubs.delete(fn);
+}
+
 // ── Refresh / countdown state ─────────────────────────────────────────────────
 const SCAN_INTERVAL = 60_000; // must match server _scan_loop interval
 let _nextScanAt  = Date.now() + SCAN_INTERVAL;
@@ -371,6 +446,7 @@ async function boot() {
     es.onmessage = ev => {
       try {
         const evt = JSON.parse(ev.data);
+        _serverEventSubs.forEach(fn => { try { fn(evt); } catch {} });
         if (evt.type === 'scan') {
           _nextScanAt = Date.now() + SCAN_INTERVAL;
           // Only flag new data + invalidate cache when the scan actually

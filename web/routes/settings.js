@@ -1,10 +1,50 @@
-import { api, state, $, fmt } from '/web/app.js';
+import { api, state, $, fmt, cacheClear, onServerEvent } from '/web/app.js';
+
+const WS_PR_PHASES = {
+  starting: 'Starting…',
+  inspect:  'Checking workspaces on disk',
+  repos:    'Fetching pull requests',
+  match:    'Matching branches to PRs',
+  done:     'Done',
+  error:    'Failed',
+};
+
+function wsPrProgressText(p) {
+  const phase = WS_PR_PHASES[p.phase] || p.phase || 'Working…';
+  if (!p.total) return phase + '…';
+  const pct = Math.min(100, Math.round((p.done / p.total) * 100));
+  const detail = p.phase === 'repos' && p.detail ? ` — ${p.detail}` : '';
+  return `${phase}: ${p.done}/${p.total} (${pct}%)${detail}`;
+}
+
+function wsPrPercent(p) {
+  if (!p.total) return 0;
+  return Math.min(100, Math.round((p.done / p.total) * 100));
+}
+
+// One sentence for both cases — freshly finished and seen on page load — so
+// the panel doesn't say two different things about the same state.
+function wsPrSummary(w) {
+  if (!w || !w.enabled) return 'Off — workspaces show their directory name.';
+  if (!w.linked) return 'On, but nothing linked yet. Click "Refresh PR links".';
+  const s = n => (n === 1 ? '' : 's');
+  let out = `Linked ${w.with_pr} PR${s(w.with_pr)} across ${w.linked}`
+    + (w.checked ? ` of ${w.checked}` : '') + ` workspace${s(w.linked)}`;
+  if (w.on_disk != null && w.inferred != null) {
+    out += ` (${w.on_disk} still on disk, ${w.inferred} resolved from history)`;
+  }
+  if (w.last_checked) {
+    out += ` — last checked ${new Date(w.last_checked * 1000).toLocaleString('sv').slice(0, 16)}`;
+  }
+  return out;
+}
 
 export default async function (root) {
   const cur = await api('/api/plan');
   const settings = await api('/api/settings');
   const plans = Object.entries(cur.pricing.plans);
   const savedClaudeDirs = settings.claude_dirs || [];
+  let wsPr = settings.workspace_prs || { enabled: false, linked: 0, with_pr: 0, gh_available: false, git_available: false };
   let originalClaudeDir = settings.claude_dir;
   root.innerHTML = `
     <div class="card">
@@ -42,6 +82,26 @@ export default async function (root) {
 
       <hr class="divider">
 
+      <h3>Associate workspaces with GitHub PRs</h3>
+      <p class="muted" style="margin:0 0 12px;max-width:820px">Off by default. When on, every workspace is relabelled <code>{repo}: #{number} - {title}</code> in Projects, Sessions and Workspaces, instead of showing the directory name — the number links to the PR on GitHub. Useful when worktree tooling names directories things like <code>dubai-v3</code>. The main checkout shows <code>{repo}: main worktree</code>. Every workspace name carries a <code>?</code> icon that reveals its directory, on hover and on click.</p>
+      <p class="muted" style="margin:0 0 12px;max-width:820px">Uses your local <code>git</code> and <code>gh</code> CLIs. <strong>Deleted worktrees resolve too</strong> — the branch survives in the transcripts and GitHub keeps merged PRs, so directories that are long gone still get their PR title. Only detached-HEAD sessions and branches that never had a PR stay unlabelled. Normal refreshes fill in new workspaces automatically; the button below re-resolves everything.</p>
+      <label class="muted" style="display:flex;align-items:flex-start;gap:8px;margin:0 0 10px;max-width:820px">
+        <input id="ws-pr-toggle" type="checkbox" ${wsPr.enabled ? 'checked' : ''}>
+        <span>Associate workspaces with GitHub PRs</span>
+      </label>
+      <div class="flex">
+        <button id="ws-pr-refresh" ${wsPr.enabled ? '' : 'disabled'}>Refresh PR links</button>
+        <span id="ws-pr-msg" class="muted">${fmt.htmlSafe(wsPrSummary(wsPr))}</span>
+      </div>
+      <div id="ws-pr-progress" class="progress-track hidden" role="progressbar"
+           aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" aria-label="Refresh progress">
+        <div id="ws-pr-bar" class="progress-bar"></div>
+      </div>
+      ${wsPr.gh_available ? '' : '<p class="muted" style="margin-top:8px;color:var(--warn)">The <code>gh</code> CLI was not found. Install it (<code>brew install gh</code>) and run <code>gh auth login</code> — without it, workspaces can still show <code>{repo}: {branch}</code> but never a PR number.</p>'}
+      ${wsPr.git_available ? '' : '<p class="muted" style="margin-top:8px;color:var(--warn)">The <code>git</code> CLI was not found, so no workspace can be resolved.</p>'}
+
+      <hr class="divider">
+
       <h3>Pricing table</h3>
       <p class="muted" style="margin:0 0 12px">Edit <code>pricing.json</code> in the project root to change rates. Reload the page after editing.</p>
       <table>
@@ -64,6 +124,95 @@ export default async function (root) {
       <h3>Privacy</h3>
       <p class="muted">Press <code>Ctrl/Cmd/Alt + B</code> anywhere, or use the topbar control, to blur prompt text and other sensitive content for screenshots.</p>
     </div>`;
+
+  const wsPrMsg = $('#ws-pr-msg');
+  const wsPrRefresh = $('#ws-pr-refresh');
+  const wsPrTrack = $('#ws-pr-progress');
+  const wsPrBar = $('#ws-pr-bar');
+
+  function showProgress(p) {
+    const pct = wsPrPercent(p);
+    wsPrTrack.classList.remove('hidden');
+    wsPrTrack.setAttribute('aria-valuenow', String(pct));
+    wsPrBar.style.width = pct + '%';
+    wsPrMsg.textContent = wsPrProgressText(p);
+    wsPrMsg.style.color = '';
+  }
+
+  function hideProgress() {
+    wsPrTrack.classList.add('hidden');
+    wsPrBar.style.width = '0%';
+  }
+
+  function paintWsPr(status, note) {
+    wsPr = status || wsPr;
+    wsPrRefresh.disabled = !wsPr.enabled;
+    wsPrMsg.textContent = note || wsPrSummary(wsPr);
+    wsPrMsg.style.color = '';
+  }
+
+  function finish(evt) {
+    hideProgress();
+    wsPrRefresh.disabled = !wsPr.enabled;
+    cacheClear();  // cached table payloads still carry the old labels
+    if (evt.error) {
+      wsPrMsg.textContent = 'Failed: ' + evt.error;
+      wsPrMsg.style.color = 'var(--bad)';
+      return;
+    }
+    paintWsPr(evt.workspace_prs);
+  }
+
+  // Progress arrives over the shared SSE stream; the refresh POST only starts it.
+  const unsubscribe = onServerEvent(evt => {
+    if (evt.type !== 'workspace-prs') return;
+    if (!document.getElementById('ws-pr-msg')) { unsubscribe(); return; }  // route changed
+    if (evt.running) showProgress(evt);
+    else finish(evt);
+  });
+
+  async function startRefresh(url, payload) {
+    wsPrRefresh.disabled = true;
+    showProgress({ phase: 'starting', done: 0, total: 0 });
+    try {
+      const r = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const data = await r.json();
+      if (!r.ok && r.status !== 409) throw new Error(data.error || ('HTTP ' + r.status));
+      if (data.workspace_prs) wsPr = data.workspace_prs;
+      if (data.started === false) {
+        wsPrMsg.textContent = 'A refresh is already running…';
+      }
+    } catch (e) {
+      hideProgress();
+      wsPrRefresh.disabled = !wsPr.enabled;
+      wsPrMsg.textContent = 'Failed: ' + e.message;
+      wsPrMsg.style.color = 'var(--bad)';
+    }
+  }
+
+  $('#ws-pr-toggle').addEventListener('change', e => {
+    const enabled = e.target.checked;
+    if (!enabled) {
+      hideProgress();
+      fetch('/api/workspace-prs', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled: false }),
+      }).then(r => r.json()).then(d => { cacheClear(); paintWsPr(d.workspace_prs); });
+      return;
+    }
+    startRefresh('/api/workspace-prs', { enabled: true });
+  });
+
+  wsPrRefresh.addEventListener('click', () => startRefresh('/api/workspace-prs/refresh', {}));
+
+  // Reconnecting mid-run (or navigating back to Settings) should show progress.
+  api('/api/workspace-prs/status').then(st => {
+    if (st.running) { wsPrRefresh.disabled = true; showProgress(st); }
+  }).catch(() => {});
 
   $('#save').addEventListener('click', async () => {
     const plan = $('#plan').value;

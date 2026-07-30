@@ -8,6 +8,7 @@ import mimetypes
 import os
 import queue
 import shutil
+import sys
 import subprocess
 import threading
 import time
@@ -15,8 +16,11 @@ from pathlib import Path
 from typing import Optional, Tuple
 from urllib.parse import urlparse, parse_qs
 
+from . import pr_links
 from .db import (
     clear_scan_data, default_claude_dir, get_setting, set_setting,
+    workspace_pr_map, save_workspace_prs, workspace_root_paths, clear_workspace_prs,
+    workspace_branches, workspace_paths_needing_pr_refresh, workspace_pr_counts,
     overview_totals, expensive_prompts, project_summary,
     tool_token_breakdown, recent_sessions, session_turns,
     session_model_tokens,
@@ -116,8 +120,9 @@ def _overview_bundle(db_path: str, since, until, pricing: dict) -> dict:
     totals["cost_usd"] = round(cost_usd, 4)
     return {
         "totals": totals,
-        "projects": project_summary(db_path, since, until),
-        "sessions": recent_sessions(db_path, limit=10, since=since, until=until),
+        "projects": _apply_workspace_labels(db_path, project_summary(db_path, since, until)),
+        "sessions": _apply_workspace_labels(
+            db_path, recent_sessions(db_path, limit=10, since=since, until=until)),
         "tools": tool_token_breakdown(db_path, since, until),
         "daily": daily_token_breakdown(db_path, since, until),
         "byModel": by_model,
@@ -135,6 +140,7 @@ def _do_refresh(db_path: str, projects_dir: str, pricing: dict) -> None:
         return
     try:
         n = scan_dir(_projects_dir(db_path, projects_dir), db_path)
+        _top_up_workspace_prs(db_path)
         _cache_clear()
         _publish_event({"type": "scan", "n": n, "ts": time.time()})
     except Exception as e:
@@ -374,6 +380,320 @@ def _validate_claude_dir(raw) -> Tuple[Optional[Path], Optional[str]]:
     return path, None
 
 
+# Budget the expensive thing — targeted GitHub round-trips. Bulk PR fetches
+# are one call per repo regardless of how many workspaces map to it.
+MAX_WORKSPACE_PR_LOOKUPS = 200
+MAX_WORKSPACE_PATHS = 5000  # runaway guard only
+
+
+def _refresh_workspace_prs(db_path: str, paths=None, resolver=None, on_progress=None) -> dict:
+    """Resolve every known workspace to its repo/PR and cache the result.
+
+    Deleted worktrees are resolved too: the branch comes from the transcripts
+    (``messages.git_branch``) and the repo from surviving sibling workspaces,
+    so a merged-and-deleted branch still finds its PR. See
+    ``pr_links.resolve_all``.
+    """
+    resolver = resolver or pr_links.resolve_all
+    paths = list(paths if paths is not None else workspace_root_paths(db_path))
+    truncated = 0
+    if len(paths) > MAX_WORKSPACE_PATHS:
+        truncated = len(paths) - MAX_WORKSPACE_PATHS
+        paths = paths[:MAX_WORKSPACE_PATHS]
+    git_bin = pr_links.find_git()
+    gh_bin = pr_links.find_gh()
+    try:
+        rows, stats = resolver(
+            paths,
+            recorded_branches=workspace_branches(db_path),
+            git_bin=git_bin, gh_bin=gh_bin,
+            max_lookups=MAX_WORKSPACE_PR_LOOKUPS,
+            on_progress=on_progress,
+        )
+    except Exception as e:
+        return {"checked": 0, "resolved": 0, "with_pr": 0, "error": str(e),
+                "gh_available": bool(gh_bin), "git_available": bool(git_bin)}
+    save_workspace_prs(db_path, rows)
+    return {**stats, "skipped": truncated,
+            "gh_available": bool(gh_bin), "git_available": bool(git_bin)}
+
+
+# A workspace usually gets its PR after work has already started, so a
+# PR-less workspace is re-checked periodically rather than once.
+WORKSPACE_PR_RECHECK_SECONDS = 900.0
+MAX_INCREMENTAL_PR_LOOKUPS = 25
+
+
+def _top_up_workspace_prs(db_path: str, resolver=None, now=None) -> dict:
+    """Resolve workspaces whose PR link is missing, as part of a normal refresh.
+
+    Runs after every scan when the setting is on, so newly-created worktrees
+    (and workspaces that have since had a PR opened) pick up their label
+    without anyone pressing "Refresh PR links". Targeted queries only, and
+    capped — a scan must never turn into a long network stall.
+    """
+    if not workspace_pr_links_enabled(db_path):
+        return {"checked": 0, "skipped_reason": "disabled"}
+    now = time.time() if now is None else now
+    paths = workspace_paths_needing_pr_refresh(
+        db_path, recheck_before=now - WORKSPACE_PR_RECHECK_SECONDS)
+    if not paths:
+        return {"checked": 0}
+    capped = paths[:MAX_INCREMENTAL_PR_LOOKUPS]
+    resolver = resolver or pr_links.resolve_all
+    # Carry forward what earlier passes learned: this run sees only a handful
+    # of (usually deleted) workspaces, so it has no live sibling to infer a
+    # repo from and would otherwise "resolve" them to nothing.
+    known = workspace_pr_map(db_path)
+    hints = pr_links.infer_repos_by_sibling(
+        {path: row.get("repo_slug") for path, row in known.items()})
+    try:
+        rows, stats = resolver(
+            capped,
+            recorded_branches=workspace_branches(db_path),
+            git_bin=pr_links.find_git(), gh_bin=pr_links.find_gh(),
+            bulk_limit=0,  # a handful of paths: query branches, don't page whole repos
+            max_lookups=MAX_INCREMENTAL_PR_LOOKUPS,
+            repo_hints=hints,
+        )
+    except Exception as e:
+        return {"checked": 0, "error": str(e)}
+    # A top-up may only improve on what is stored. Writing an empty result over
+    # a good label would quietly erase attribution on every scan.
+    keep, downgraded = [], 0
+    for row in rows:
+        if row.get("label") or not (known.get(row.get("path")) or {}).get("label"):
+            keep.append(row)
+        else:
+            downgraded += 1
+    save_workspace_prs(db_path, keep)
+    return {**stats, "pending": max(0, len(paths) - len(capped)),
+            "kept_existing": downgraded}
+
+
+# One refresh at a time: it's a long network job, and two concurrent passes
+# would interleave their progress events into nonsense.
+WORKSPACE_PR_LOCK = threading.Lock()
+_WORKSPACE_PR_PROGRESS: dict = {"running": False}
+_WORKSPACE_PR_PROGRESS_LOCK = threading.Lock()
+_PROGRESS_MIN_INTERVAL = 0.2  # seconds between pushed events
+
+
+def workspace_pr_progress() -> dict:
+    with _WORKSPACE_PR_PROGRESS_LOCK:
+        return dict(_WORKSPACE_PR_PROGRESS)
+
+
+def _set_workspace_pr_progress(**fields) -> dict:
+    with _WORKSPACE_PR_PROGRESS_LOCK:
+        _WORKSPACE_PR_PROGRESS.update(fields)
+        return dict(_WORKSPACE_PR_PROGRESS)
+
+
+def _refresh_workspace_prs_async(db_path: str, resolver=None) -> dict:
+    """Kick off a full refresh in the background, streaming progress over SSE.
+
+    Returns immediately: a full pass is ~a minute of network calls, far too
+    long to hold a request open. Progress arrives as ``workspace-prs`` events
+    and is also readable from ``/api/workspace-prs/status`` for a client that
+    reconnects mid-run.
+    """
+    if not WORKSPACE_PR_LOCK.acquire(blocking=False):
+        return {"started": False, "reason": "already-running", **workspace_pr_progress()}
+
+    state = _set_workspace_pr_progress(
+        running=True, phase="starting", done=0, total=0, detail=None,
+        started_at=time.time(), finished_at=None, stats=None, error=None)
+    _publish_event({"type": "workspace-prs", **state})
+
+    def work():
+        last = [0.0]
+
+        def on_progress(p):
+            now = time.time()
+            # Throttle: "inspect" fires once per workspace and would otherwise
+            # push hundreds of events a second down the stream.
+            final = p.get("done") and p.get("done") == p.get("total")
+            if not final and now - last[0] < _PROGRESS_MIN_INTERVAL:
+                _set_workspace_pr_progress(**p)
+                return
+            last[0] = now
+            _publish_event({"type": "workspace-prs", **_set_workspace_pr_progress(**p)})
+
+        try:
+            out = _refresh_workspace_prs(db_path, resolver=resolver, on_progress=on_progress)
+            _cache_clear()
+            state = _set_workspace_pr_progress(
+                running=False, phase="done", finished_at=time.time(), stats=out,
+                error=out.get("error"))
+        except Exception as e:
+            state = _set_workspace_pr_progress(
+                running=False, phase="error", finished_at=time.time(), error=str(e))
+        finally:
+            WORKSPACE_PR_LOCK.release()
+        _publish_event({"type": "workspace-prs", **state,
+                        "workspace_prs": _workspace_pr_status(db_path)})
+
+    threading.Thread(target=work, daemon=True).start()
+    return {"started": True, **state}
+
+
+def _workspace_label(info: dict) -> Optional[str]:
+    """Render a cached workspace row for display.
+
+    Rebuilt from the stored parts rather than reusing the stored ``label``
+    string, so a change to the label format takes effect on the next page
+    load instead of requiring everyone to re-run a network refresh.
+    """
+    pr = None
+    if info.get("pr_number"):
+        pr = {"number": info["pr_number"], "title": info.get("pr_title")}
+    return pr_links.build_label(
+        {"repo": info.get("repo"), "is_main": info.get("is_main"), "branch": info.get("branch")},
+        pr,
+    )
+
+
+def _apply_workspace_labels(db_path: str, payload, name_keys=("project_name",),
+                            path_key: str = "workspace_path", field_prefix: str = ""):
+    """Swap workspace display names for their GitHub PR label, in place.
+
+    A no-op unless the setting is on and the workspace has a cached label, so
+    a workspace whose worktree has been deleted (the usual fate of a merged
+    branch) keeps the directory-derived name it always had.
+
+    ``payload`` may be a row, a list of rows, or a dict of lists; it is
+    returned unchanged so callers can wrap a query result inline.
+    """
+    if not workspace_pr_links_enabled(db_path):
+        return payload
+    labels = workspace_pr_map(db_path)
+    if not labels:
+        return payload
+
+    def decorate(row):
+        if not isinstance(row, dict):
+            return
+        info = labels.get(row.get(path_key))
+        if not info:
+            return
+        label = _workspace_label(info)
+        if not label:
+            return
+        for key in name_keys:
+            if key in row and row[key]:
+                row.setdefault(f"{key}_original", row[key])
+                row[key] = label
+        # Prefixed because a row can name two workspaces (cross-workspace
+        # leaks name a source and a target); unprefixed they'd overwrite.
+        for field in ("pr_number", "pr_title", "pr_url", "pr_state", "repo"):
+            row[f"{field_prefix}{field}"] = info.get(field)
+
+    if isinstance(payload, list):
+        for row in payload:
+            decorate(row)
+    elif isinstance(payload, dict):
+        decorate(payload)
+    return payload
+
+
+def _apply_sankey_labels(db_path: str, matrix: dict) -> dict:
+    """Relabel Sankey nodes, keeping the ' (agent)'/' (files)' suffixes.
+
+    Node names are also link endpoints, so both sides have to be rewritten
+    with the same mapping or ECharts drops the links.
+
+    Relabelling is many-to-one — several worktrees can carry the same PR, and
+    every worktree of a repo shares one "main worktree" label — so distinct
+    nodes collapse onto one name. ECharts' Sankey requires unique node names
+    and throws on duplicates, so merged nodes and their links are combined.
+    """
+    if not workspace_pr_links_enabled(db_path) or not isinstance(matrix, dict):
+        return matrix
+    labels = workspace_pr_map(db_path)
+    if not labels:
+        return matrix
+    rename: dict = {}
+    for node in matrix.get("nodes") or []:
+        info = labels.get(node.get("workspace_path"))
+        label = _workspace_label(info) if info else None
+        if not label:
+            continue
+        name = node.get("name") or ""
+        for suffix in (" (agent)", " (files)"):
+            if name.endswith(suffix):
+                new = f"{label}{suffix}"
+                break
+        else:
+            new = label
+        if new != name:
+            rename[name] = new
+            node["name_original"] = name
+            node["name"] = new
+
+    if rename:
+        # Merge nodes that now share a name, keeping every path they stand for
+        # so the tooltip can still say which directories are behind the label.
+        merged: dict = {}
+        for node in matrix.get("nodes") or []:
+            name = node.get("name")
+            keep = merged.get(name)
+            if keep is None:
+                node["workspace_paths"] = [p for p in [node.get("workspace_path")] if p]
+                merged[name] = node
+                continue
+            path = node.get("workspace_path")
+            if path and path not in keep["workspace_paths"]:
+                keep["workspace_paths"].append(path)
+        matrix["nodes"] = list(merged.values())
+
+        for link in matrix.get("links") or []:
+            if link.get("source") in rename:
+                link["source"] = rename[link["source"]]
+            if link.get("target") in rename:
+                link["target"] = rename[link["target"]]
+        # Two links can now join the same pair; sum them into one ribbon.
+        combined: dict = {}
+        for link in matrix.get("links") or []:
+            key = (link.get("source"), link.get("target"))
+            if key in combined:
+                combined[key]["value"] = (combined[key].get("value") or 0) + (link.get("value") or 0)
+            else:
+                combined[key] = link
+        matrix["links"] = list(combined.values())
+    return matrix
+
+
+WORKSPACE_PR_SETTING = "workspace_pr_links"
+
+
+def workspace_pr_links_enabled(db_path: str) -> bool:
+    """Whether to relabel workspaces with their GitHub PR. Off by default."""
+    return get_setting(db_path, WORKSPACE_PR_SETTING, "0") == "1"
+
+
+def _workspace_pr_status(db_path: str) -> dict:
+    """Everything the Settings panel needs to describe the current association.
+
+    Carries the same counts a just-finished refresh reports, so the panel can
+    say one thing whether you have just run it or are seeing it on page load.
+    """
+    rows = workspace_pr_map(db_path)
+    counts = workspace_pr_counts(db_path)
+    checked_at = [r.get("checked_at") for r in rows.values() if r.get("checked_at")]
+    return {
+        "enabled": workspace_pr_links_enabled(db_path),
+        "linked": len(rows),
+        "with_pr": sum(1 for r in rows.values() if r.get("pr_number")),
+        "checked": counts["checked"],
+        "on_disk": counts["on_disk"],
+        "inferred": counts["inferred"],
+        "last_checked": max(checked_at) if checked_at else None,
+        "gh_available": bool(pr_links.find_gh()),
+        "git_available": bool(pr_links.find_git()),
+    }
+
+
 def _settings_payload(db_path: str, projects_override: Optional[str] = None) -> dict:
     claude_dir = _claude_dir(db_path)
     projects_dir = _projects_dir(db_path, projects_override)
@@ -382,6 +702,7 @@ def _settings_payload(db_path: str, projects_override: Optional[str] = None) -> 
         "projects_dir": str(projects_dir),
         "projects_overridden": bool(projects_override),
         "claude_dirs": _claude_dirs(db_path),
+        "workspace_prs": _workspace_pr_status(db_path),
     }
 
 
@@ -447,7 +768,7 @@ def build_handler(db_path: str, projects_dir: Optional[str] = None):
                 cached = _cache_get(cache_key)
                 if cached is not None:
                     return _send_json(self, cached)
-                data = project_summary(db_path, since, until)
+                data = _apply_workspace_labels(db_path, project_summary(db_path, since, until))
                 _cache_set(cache_key, data)
                 return _send_json(self, data)
             if path == "/api/tools":
@@ -461,10 +782,10 @@ def build_handler(db_path: str, projects_dir: Optional[str] = None):
                 cached = _cache_get(cache_key)
                 if cached is not None:
                     return _send_json(self, cached)
-                data = recent_sessions(
+                data = _apply_workspace_labels(db_path, recent_sessions(
                     db_path, limit=_clamp_limit(qs.get("limit", ["20"])[0], 20),
                     since=since, until=until,
-                )
+                ))
                 by_model = session_model_tokens(db_path, [s["session_id"] for s in data])
                 for s in data:
                     total = 0.0
@@ -549,14 +870,14 @@ def build_handler(db_path: str, projects_dir: Optional[str] = None):
                 cached = _cache_get(cache_key)
                 if cached is not None:
                     return _send_json(self, cached)
-                data = session_turns(db_path, sid)
+                data = _apply_workspace_labels(db_path, session_turns(db_path, sid))
                 _cache_set(cache_key, data)
                 return _send_json(self, data)
             if path == "/api/workspaces":
                 cached = _cache_get(cache_key)
                 if cached is not None:
                     return _send_json(self, cached)
-                data = workspaces_matrix(db_path, since, until)
+                data = _apply_sankey_labels(db_path, workspaces_matrix(db_path, since, until))
                 _cache_set(cache_key, data)
                 return _send_json(self, data)
             if path == "/api/cross-workspace-leaks":
@@ -567,6 +888,9 @@ def build_handler(db_path: str, projects_dir: Optional[str] = None):
                     db_path, limit=_clamp_limit(qs.get("limit", ["20"])[0], 20),
                     since=since, until=until,
                 )
+                # Each leak row names two workspaces, so relabel both sides.
+                _apply_workspace_labels(db_path, data, ("source",), "source_path", "source_")
+                _apply_workspace_labels(db_path, data, ("target",), "target_path", "target_")
                 _cache_set(cache_key, data)
                 return _send_json(self, data)
             if path == "/api/subagents":
@@ -578,20 +902,21 @@ def build_handler(db_path: str, projects_dir: Optional[str] = None):
                     c = cost_for(r["model"], r, pricing)
                     r["cost_usd"] = c["usd"]
                     r["cost_estimated"] = c["estimated"]
-                top = top_subagent_sessions(
+                top = _apply_workspace_labels(db_path, top_subagent_sessions(
                     db_path, limit=_clamp_limit(qs.get("limit", ["20"])[0], 20),
                     since=since, until=until,
-                )
+                ))
                 orch = orchestration_breakdown(db_path, since, until)
+                _apply_workspace_labels(db_path, orch.get("sdk_runs") or [], ("workspace",))
                 for bucket in ("by_kind", "by_entrypoint"):
                     for r in orch[bucket]:
                         c = cost_for(r["model"], r, pricing)
                         r["cost_usd"] = c["usd"]
                         r["cost_estimated"] = c["estimated"]
-                tree = dispatch_tree(
+                tree = _apply_workspace_labels(db_path, dispatch_tree(
                     db_path, limit=_clamp_limit(qs.get("limit", ["50"])[0], 50),
                     since=since, until=until,
-                )
+                ))
                 for r in tree:
                     child_models = r["models"] or []
                     if child_models:
@@ -638,6 +963,9 @@ def build_handler(db_path: str, projects_dir: Optional[str] = None):
                 return _send_json(self, scan_commands())
             if path == "/api/agents":
                 return _send_json(self, scan_agents())
+            if path == "/api/workspace-prs/status":
+                return _send_json(self, {**workspace_pr_progress(),
+                                         "workspace_prs": _workspace_pr_status(db_path)})
             if path == "/api/settings":
                 return _send_json(self, _settings_payload(db_path, projects_dir))
             if path == "/api/scan":
@@ -703,6 +1031,23 @@ def build_handler(db_path: str, projects_dir: Optional[str] = None):
                                 clear_scan_data(db_path)
                     _cache_clear()
                     return _send_json(self, {"ok": True, **_settings_payload(db_path, projects_dir)})
+                if url.path == "/api/workspace-prs":
+                    enabled = bool(body.get("enabled"))
+                    set_setting(db_path, WORKSPACE_PR_SETTING, "1" if enabled else "0")
+                    if not enabled and body.get("clear"):
+                        clear_workspace_prs(db_path)
+                    _cache_clear()  # cached payloads carry the old labels
+                    result = {"ok": True}
+                    if enabled and body.get("refresh", True):
+                        result.update(_refresh_workspace_prs_async(db_path))
+                    return _send_json(self, {**result, "workspace_prs": _workspace_pr_status(db_path)})
+                if url.path == "/api/workspace-prs/refresh":
+                    if not workspace_pr_links_enabled(db_path):
+                        return _send_error(self, 400, "workspace PR links are turned off")
+                    started = _refresh_workspace_prs_async(db_path)
+                    # 202: the work runs in the background and reports over SSE.
+                    return _send_json(self, {"ok": True, **started},
+                                      status=202 if started.get("started") else 409)
                 if url.path == "/api/tips/dismiss":
                     dismiss_tip(db_path, body.get("key", ""))
                     _cache_clear()
@@ -729,7 +1074,11 @@ def _scan_loop(db_path: str, projects_dir: Optional[str] = None, interval: float
             if SCAN_LOCK.acquire(blocking=False):
                 try:
                     n = scan_dir(_projects_dir(db_path, projects_dir), db_path)
-                    if n["messages"] > 0:
+                    # Top up PR links for workspaces that appeared (or had a PR
+                    # opened) since the last pass. A no-op when nothing is
+                    # missing, so the steady state costs no network calls.
+                    topped = _top_up_workspace_prs(db_path)
+                    if n["messages"] > 0 or topped.get("with_pr"):
                         _cache_clear()
                     # Emit the event even when messages == 0 so the frontend's
                     # "Getting latest data…" banner clears once the scan finishes.
@@ -740,6 +1089,26 @@ def _scan_loop(db_path: str, projects_dir: Optional[str] = None, interval: float
         except Exception as e:
             _publish_event({"type": "error", "message": str(e)})
         time.sleep(interval)
+
+
+class QuietThreadingHTTPServer(http.server.ThreadingHTTPServer):
+    """A server that doesn't dump a traceback every time a client hangs up.
+
+    Browsers reset keep-alive and speculative connections routinely, and the
+    SSE stream is dropped on every page navigation and reload. socketserver's
+    default ``handle_error`` prints a full traceback for each one — dozens of
+    them in normal use — which buries anything that actually matters.
+
+    Only connection-level errors are swallowed; everything else still prints.
+    """
+
+    def handle_error(self, request, client_address):
+        exc = sys.exc_info()[1]
+        # ConnectionError covers reset/aborted/broken-pipe; TimeoutError is an
+        # idle keep-alive socket expiring. Neither is actionable.
+        if isinstance(exc, (ConnectionError, TimeoutError)):
+            return
+        super().handle_error(request, client_address)
 
 
 def run(host: str, port: int, db_path: str, projects_dir: Optional[str] = None):
@@ -755,5 +1124,5 @@ def run(host: str, port: int, db_path: str, projects_dir: Optional[str] = None):
     threading.Thread(target=_warm_rest, daemon=True).start()
     threading.Thread(target=_scan_loop, args=(db_path, projects_dir), daemon=True).start()
     H = build_handler(db_path, projects_dir)
-    httpd = http.server.ThreadingHTTPServer((host, port), H)
+    httpd = QuietThreadingHTTPServer((host, port), H)
     httpd.serve_forever()

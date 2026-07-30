@@ -1,4 +1,4 @@
-import { api, fmt, makeSortable, cacheGet, cacheSet } from '/web/app.js';
+import { api, fmt, makeSortable, cacheGet, cacheSet, workspaceLabel, bindWorkspaceTooltips } from '/web/app.js';
 
 export default async function (root) {
   // Parse /sessions/<id>?filter=...&sort=...&dir=... without triggering re-render
@@ -97,6 +97,7 @@ function buildList(root, list, qs) {
   // A custom from/to range takes precedence over the quick-period tabs.
   const state = {
     project:   qs.get('project') || '',
+    repo:      qs.get('repo') || '',
     q:         qs.get('q') || '',
     period:    PERIODS.some(p => p.key === qs.get('period')) ? qs.get('period') : 'all',
     from:      qs.get('from') || '',
@@ -111,6 +112,14 @@ function buildList(root, list, qs) {
     .sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()));
   const projectSet = new Set(projects.map(p => p.toLowerCase()));
 
+  // Repositories come from the workspace→PR association, so the selector is
+  // empty until that setting is on and a refresh has run.
+  const repos = [...new Set(list.map(s => s.repo).filter(Boolean))]
+    .sort((a, b) => a.toLowerCase().localeCompare(b.toLowerCase()));
+  // No repositories means the selector isn't rendered at all; drop any repo
+  // left in the URL so a stale link doesn't filter every row away invisibly.
+  if (!repos.length) state.repo = '';
+
   root.innerHTML = `
     <div class="card">
       <div class="flex" style="margin-bottom:14px;flex-wrap:wrap;gap:10px;align-items:center">
@@ -121,6 +130,11 @@ function buildList(root, list, qs) {
         </div>
       </div>
       <div class="flex" style="margin-bottom:10px;flex-wrap:wrap;gap:10px;align-items:center">
+        ${repos.length ? `
+        <select id="f-repo" style="min-width:150px" title="Filter by repository">
+          <option value="">all repositories</option>
+          ${repos.map(r => `<option value="${fmt.htmlSafe(r)}" ${r === state.repo ? 'selected' : ''}>${fmt.htmlSafe(r)}</option>`).join('')}
+        </select>` : ''}
         <span class="ac" style="min-width:170px"><input id="f-project" autocomplete="off" placeholder="all projects…" value="${fmt.htmlSafe(state.project)}" style="width:100%" title="Filter by project — type to autocomplete, or pick from the list"></span>
         <span class="ac" style="flex:1;min-width:180px"><input id="f-search" type="search" autocomplete="off" placeholder="search project or session…" value="${fmt.htmlSafe(state.q)}" style="width:100%" title="Substring match on project name or session id"></span>
         <input id="f-mincost" type="number" min="0" step="0.5" placeholder="min $" value="${fmt.htmlSafe(state.minCost)}" style="width:90px" title="Minimum cost (USD)">
@@ -142,9 +156,9 @@ function buildList(root, list, qs) {
           ${list.map(s => {
             const proj = s.project_name || s.project_slug || '';
             return `
-            <tr data-project="${fmt.htmlSafe(proj)}" data-started="${s.started || ''}" data-turns="${s.turns || 0}" data-tokens="${s.tokens || 0}" data-cost="${s.cost_usd ?? ''}" data-cost-est="${s.cost_estimated ? '1' : ''}" data-session="${fmt.htmlSafe(s.session_id || '')}">
+            <tr data-project="${fmt.htmlSafe(proj)}" data-repo="${fmt.htmlSafe(s.repo || '')}" data-started="${s.started || ''}" data-turns="${s.turns || 0}" data-tokens="${s.tokens || 0}" data-cost="${s.cost_usd ?? ''}" data-cost-est="${s.cost_estimated ? '1' : ''}" data-session="${fmt.htmlSafe(s.session_id || '')}">
               <td class="mono" data-val="${s.started || ''}">${fmt.ts(s.started)}</td>
-              <td class="blur-sensitive" data-val="${fmt.htmlSafe(proj)}" title="${fmt.htmlSafe(s.project_slug)}">${fmt.htmlSafe(proj)}</td>
+              <td class="blur-sensitive" data-val="${fmt.htmlSafe(proj)}">${workspaceLabel(proj, s.workspace_path, { prNumber: s.pr_number, prUrl: s.pr_url })}</td>
               <td class="num" data-val="${s.turns || 0}">${fmt.int(s.turns)}</td>
               <td class="num" data-val="${s.tokens || 0}">${fmt.int(s.tokens)}</td>
               <td class="num blur-sensitive" data-val="${s.cost_usd ?? ''}">${s.cost_usd == null ? '<span class="muted">—</span>' : fmt.usd(s.cost_usd)}${s.cost_estimated ? '<span class="muted" title="pricing estimated from model tier">*</span>' : ''}</td>
@@ -172,6 +186,7 @@ function buildList(root, list, qs) {
   // ── URL persistence ──────────────────────────────────────────────────────
   function writeState(col, dir) {
     const p = new URLSearchParams();
+    if (state.repo)      p.set('repo', state.repo);
     if (state.project)   p.set('project', state.project);
     if (state.q)         p.set('q', state.q);
     if (state.from)      p.set('from', state.from);
@@ -214,6 +229,7 @@ function buildList(root, list, qs) {
 
     for (const tr of rows) {
       const proj    = tr.dataset.project || '';
+      const repo    = tr.dataset.repo || '';
       const started = tr.dataset.started || '';
       const tokens  = Number(tr.dataset.tokens || 0);
       const turns   = Number(tr.dataset.turns || 0);
@@ -221,13 +237,14 @@ function buildList(root, list, qs) {
       const session = tr.dataset.session || '';
 
       const t = started ? new Date(started).getTime() : NaN;
+      const okRepo    = !state.repo || repo === state.repo;
       const okProject = !pf || (pfExact ? proj.toLowerCase() === pf : proj.toLowerCase().includes(pf));
       const okSearch  = !needle || proj.toLowerCase().includes(needle) || session.toLowerCase().includes(needle);
       const okPeriod  = (minMs === -Infinity && maxMs === Infinity) || (!Number.isNaN(t) && t >= minMs && t <= maxMs);
       const okCost    = minCost == null || (cost != null && cost >= minCost);
       const okTokens  = minTok == null || tokens >= minTok;
 
-      const show = okProject && okSearch && okPeriod && okCost && okTokens;
+      const show = okRepo && okProject && okSearch && okPeriod && okCost && okTokens;
       tr.style.display = show ? '' : 'none';
       if (show) {
         visible++;
@@ -248,6 +265,10 @@ function buildList(root, list, qs) {
   // Text/number inputs run through a debounce so typing stays smooth even with
   // hundreds of rows; selecting a datalist suggestion also fires 'input'.
   const refresh = debounce(() => { applyFilters(); writeState(lastCol, lastDir); }, 150);
+  el('#f-repo')?.addEventListener('change', e => {
+    state.repo = e.target.value;
+    applyFilters(); writeState(lastCol, lastDir);
+  });
   el('#f-project').addEventListener('input', e => { state.project = e.target.value; refresh(); });
   el('#f-search').addEventListener('input', e => { state.q = e.target.value; refresh(); });
   el('#f-mincost').addEventListener('input', e => { state.minCost = e.target.value; refresh(); });
@@ -283,7 +304,8 @@ function buildList(root, list, qs) {
   }
 
   el('#f-clear').addEventListener('click', () => {
-    Object.assign(state, { project: '', q: '', period: 'all', from: '', to: '', minCost: '', minTokens: '' });
+    Object.assign(state, { repo: '', project: '', q: '', period: 'all', from: '', to: '', minCost: '', minTokens: '' });
+    if (el('#f-repo')) el('#f-repo').value = '';
     el('#f-project').value = '';
     el('#f-search').value = '';
     el('#f-mincost').value = '';
@@ -304,6 +326,7 @@ function buildList(root, list, qs) {
       writeState(col, dir);
     },
   });
+  bindWorkspaceTooltips(root);
 }
 
 // ── Session detail ────────────────────────────────────────────────────────────
@@ -333,7 +356,11 @@ function buildSession(root, id, turns, initFilter, initCol, initDir) {
   const slug    = (turns[0] && turns[0].project_slug) || '';
   const cwd     = (turns.find(t => t.cwd) || {}).cwd || '';
   const base    = cwd ? cwd.replace(/\\/g, '/').replace(/\/+$/, '').split('/').pop() : '';
-  const project = base || slug;
+  // project_name is server-decorated (PR label when the setting is on); the
+  // cwd basename is only a fallback for rows that predate that.
+  const head    = turns.find(t => t.project_name) || {};
+  const project = head.project_name || base || slug;
+  const wsPath  = head.workspace_path || cwd;
   const started = (turns[0] && turns[0].timestamp) || '';
   const ended   = (turns[turns.length - 1] && turns[turns.length - 1].timestamp) || '';
 
@@ -358,7 +385,7 @@ function buildSession(root, id, turns, initFilter, initCol, initDir) {
         <a href="#/sessions" class="muted" style="white-space:nowrap">← all sessions</a>
       </h2>
       <div class="flex muted" style="font-family:var(--mono);font-size:12px;flex-wrap:wrap;gap:14px">
-        <span class="blur-sensitive">${fmt.htmlSafe(project)}</span>
+        <span class="blur-sensitive">${workspaceLabel(project, wsPath, { prNumber: head.pr_number, prUrl: head.pr_url })}</span>
         <span>${fmt.ts(started)} → ${fmt.ts(ended)}</span>
         <span>${turns.length} records</span>
         <span>${fmt.int(totalIn)} in · ${fmt.int(totalOut)} out · ${fmt.int(totalCacheRd)} cache rd</span>
@@ -459,4 +486,6 @@ function buildSession(root, id, turns, initFilter, initCol, initDir) {
       writeState();
     },
   });
+
+  bindWorkspaceTooltips(root);
 }

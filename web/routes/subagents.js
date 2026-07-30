@@ -1,4 +1,4 @@
-import { api, fmt } from '/web/app.js';
+import { api, fmt, workspaceLabel, bindWorkspaceTooltips } from '/web/app.js';
 import { stackedBarChart } from '/web/charts.js';
 
 const RANGES = [
@@ -145,7 +145,7 @@ export default async function (root) {
           ${sdkRuns.length === 0 ? '<tr><td colspan="7" class="muted">no SDK-orchestrated runs in this range</td></tr>' : sdkRuns.map(r => `
             <tr>
               <td><span class="badge blur-sensitive">${fmt.htmlSafe(r.entrypoint)}</span></td>
-              <td class="blur-sensitive" title="${fmt.htmlSafe(r.cwd || '')}">${fmt.htmlSafe(r.workspace || r.project_slug)}</td>
+              <td class="blur-sensitive">${workspaceLabel(r.workspace || r.project_slug, r.workspace_path || r.cwd, { prNumber: r.pr_number, prUrl: r.pr_url })}</td>
               <td class="num">${fmt.int(r.sessions)}</td>
               <td class="num">${fmt.int(r.messages)}</td>
               <td class="num">${fmt.int(r.io_tokens)}</td>
@@ -233,7 +233,7 @@ export default async function (root) {
               <td>${(t.models || []).map(m => `<span class="badge model-${fmt.modelClass(m)}">${fmt.htmlSafe(fmt.modelShort(m))}</span>`).join(' ')}</td>
               <td class="mono blur-sensitive" style="font-size:11px">${t.subagent_type ? fmt.htmlSafe(t.subagent_type) : '<span class="muted">—</span>'}</td>
               <td class="mono blur-sensitive" style="font-size:11px" title="${fmt.htmlSafe(t.session_id)}">${fmt.htmlSafe(t.session_id.slice(0, 8))}…</td>
-              <td class="blur-sensitive">${fmt.htmlSafe(t.project_name || t.project_slug || '')}</td>
+              <td class="blur-sensitive">${workspaceLabel(t.project_name || t.project_slug || '', t.workspace_path, { prNumber: t.pr_number, prUrl: t.pr_url })}</td>
               <td class="num">${fmt.int(t.thread_msgs)}</td>
               <td class="num">${fmt.int(t.io_tokens)}</td>
               <td class="num blur-sensitive">${fmt.usd(t.child_cost_usd)}${t.child_cost_estimated ? ' <span class="muted">~</span>' : ''}</td>
@@ -268,7 +268,7 @@ export default async function (root) {
         <tbody>
           ${tops.length === 0 ? '<tr><td colspan="6" class="muted">no subagent activity in this range</td></tr>' : tops.map(t => `
             <tr class="clickable" data-session="${fmt.htmlSafe(t.session_id)}">
-              <td class="blur-sensitive">${fmt.htmlSafe(t.project_name || t.project_slug)}</td>
+              <td class="blur-sensitive">${workspaceLabel(t.project_name || t.project_slug, t.workspace_path, { prNumber: t.pr_number, prUrl: t.pr_url })}</td>
               <td class="mono blur-sensitive" style="font-size:11px" title="${fmt.htmlSafe(t.session_id)}">${fmt.htmlSafe(t.session_id.slice(0, 8))}…</td>
               <td class="num">${fmt.int(t.subagent_msgs)}</td>
               <td class="num">${fmt.int(t.io_tokens)}</td>
@@ -285,7 +285,9 @@ export default async function (root) {
   });
   root.querySelectorAll('tr.clickable').forEach(tr => {
     tr.style.cursor = 'pointer';
-    tr.addEventListener('click', () => {
+    tr.addEventListener('click', e => {
+      // A workspace cell can hold a PR link; don't hijack it into navigation.
+      if (e.target.closest('a, .ws-info')) return;
       location.hash = '#/sessions/' + tr.dataset.session;
     });
   });
@@ -301,4 +303,6 @@ export default async function (root) {
     categories: epChart.categories,
     series: epChart.series,
   });
+
+  bindWorkspaceTooltips(root);
 }
