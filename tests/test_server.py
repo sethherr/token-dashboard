@@ -8,6 +8,7 @@ import threading
 import time
 import unittest
 import urllib.request
+from unittest import mock
 import urllib.error
 
 from pathlib import Path
@@ -209,7 +210,12 @@ class ServerTests(unittest.TestCase):
             self.assertIn("cost_usd", body["breakdown"][0])
 
     def test_rtk_json_reports_when_cli_is_missing(self):
-        body = server._rtk_payload(home=os.path.join(self.tmp, "no-rtk-home"))
+        # Empty PATH, an empty home, and no absolute fallback dirs (a real rtk
+        # in /opt/homebrew/bin on the test machine must not leak in).
+        with mock.patch.object(server, "_RTK_FALLBACK_DIRS", ()):
+            body = server._rtk_payload(
+                home=os.path.join(self.tmp, "no-rtk-home"), env={"PATH": ""}
+            )
         self.assertFalse(body["available"])
         self.assertIn("install_url", body)
         self.assertIsNone(body["summary"])
