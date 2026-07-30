@@ -31,6 +31,13 @@ Claude Code writes one JSONL file per session to `~/.claude/projects/<project-sl
 - **Small files with clear responsibilities.** Prefer one concern per module. Once a file passes ~500 lines or starts accreting unrelated concerns, ask whether it's time to split — `db.py` and `server.py` are the current outliers and OK as-is.
 - **Workspace labels go through one path.** A workspace is identified by its root path (`workspace_path` on API rows). Any new endpoint that shows a workspace name must carry that path and run through `server._apply_workspace_labels`, or the optional PR relabelling will silently skip it. On the frontend use `workspaceLabel()` + `bindWorkspaceTooltips()` from `web/app.js` so the path tooltip comes along.
 - **Streaming-snapshot dedup.** When adding scanner logic that joins the `messages` table, remember `(session_id, message_id)` is the dedup key, not `uuid`. See `scanner._evict_prior_snapshots_bulk` and the migration note in `db._migrate_add_message_id`.
+- **Pithy comments.** Comment the non-obvious *why* — a constraint, a gotcha, a rejected alternative — in a line or two. Don't restate what the code says, don't preamble a function with its own signature, and don't explain a stdlib call. If it needs a paragraph, it probably belongs in `docs/` or a commit message.
+
+## Writing PRs
+
+Short. Lead with the user-visible change in a sentence or two, then only what a reviewer can't get from the diff: why this approach, what to watch out for, tests run. Bullets over prose, no section headers on a small PR, no restating the diff file by file. Screenshots for UI changes.
+
+Never append "Generated with Claude Code", a Claude Code link, or any similar attribution footer to a PR description.
 
 ## Customizing
 

@@ -55,7 +55,7 @@ class CliTests(unittest.TestCase):
 
 
 class EnvFlagTests(unittest.TestCase):
-    """NO_AUTO_OPEN_BROWSER and friends: only explicit truthy values count."""
+    """Only explicit truthy values count."""
 
     def setUp(self):
         sys.path.insert(0, ROOT)

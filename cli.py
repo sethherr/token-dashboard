@@ -30,8 +30,7 @@ def _projects_override(args) -> Optional[str]:
 
 
 def _env_flag(name: str) -> bool:
-    """True for 1/true/yes/on (any case). Anything else — including unset — is
-    False, so a stray value never silently turns a feature on."""
+    """True for 1/true/yes/on. Anything else, including unset, is False."""
     return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
 
 
