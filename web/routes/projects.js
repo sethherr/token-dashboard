@@ -21,7 +21,7 @@ function renderProjects(root, rows) {
         <tbody>
           ${rows.map(r => `
             <tr>
-              <td class="blur-sensitive" data-val="${fmt.htmlSafe(r.project_name || r.project_slug)}">${workspaceLabel(r.project_name || r.project_slug, r.workspace_path)}</td>
+              <td class="blur-sensitive" data-val="${fmt.htmlSafe(r.project_name || r.project_slug)}">${workspaceLabel(r.project_name || r.project_slug, r.workspace_path, { prNumber: r.pr_number, prUrl: r.pr_url })}</td>
               <td class="num" data-val="${r.sessions || 0}">${fmt.int(r.sessions)}</td>
               <td class="num" data-val="${r.turns || 0}">${fmt.int(r.turns)}</td>
               <td class="num" data-val="${r.billable_tokens || 0}">${fmt.int(r.billable_tokens)}</td>

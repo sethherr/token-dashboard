@@ -88,9 +88,9 @@ export default async function (root) {
         <tbody>
           ${leaks.length === 0 ? '<tr><td colspan="6" class="muted">no cross-workspace activity in this range</td></tr>' : leaks.map(l => `
             <tr>
-              <td>${workspaceLabel(l.source, l.source_path, { className: 'badge blur-sensitive' })}</td>
+              <td>${workspaceLabel(l.source, l.source_path, { className: 'blur-sensitive', prNumber: l.source_pr_number, prUrl: l.source_pr_url })}</td>
               <td class="muted">→</td>
-              <td>${workspaceLabel(l.target, l.target_path, { className: 'badge blur-sensitive' })}</td>
+              <td>${workspaceLabel(l.target, l.target_path, { className: 'blur-sensitive', prNumber: l.target_pr_number, prUrl: l.target_pr_url })}</td>
               <td class="num">${fmt.int(l.calls)}</td>
               <td class="num">${fmt.int(l.sessions)}</td>
               <td class="mono" style="font-size:11px">

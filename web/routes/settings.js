@@ -51,7 +51,7 @@ export default async function (root) {
       <hr class="divider">
 
       <h3>Associate workspaces with GitHub PRs</h3>
-      <p class="muted" style="margin:0 0 12px;max-width:820px">Off by default. When on, every workspace is relabelled <code>{repo}: PR #{number} - {title}</code> in Projects, Sessions and Workspaces, instead of showing the directory name. Useful when worktree tooling names directories things like <code>dubai-v3</code>. The main checkout shows <code>{repo}: main worktree</code>. Hover or click any workspace name to see its path.</p>
+      <p class="muted" style="margin:0 0 12px;max-width:820px">Off by default. When on, every workspace is relabelled <code>{repo}: #{number} - {title}</code> in Projects, Sessions and Workspaces, instead of showing the directory name — the number links to the PR on GitHub. Useful when worktree tooling names directories things like <code>dubai-v3</code>. The main checkout shows <code>{repo}: main worktree</code>. Every workspace name carries a <code>?</code> icon that reveals its directory, on hover and on click.</p>
       <p class="muted" style="margin:0 0 12px;max-width:820px">Uses your local <code>git</code> and <code>gh</code> CLIs. <strong>Deleted worktrees resolve too</strong> — the branch survives in the transcripts and GitHub keeps merged PRs, so directories that are long gone still get their PR title. Only detached-HEAD sessions and branches that never had a PR stay unlabelled. Normal refreshes fill in new workspaces automatically; the button below re-resolves everything.</p>
       <label class="muted" style="display:flex;align-items:flex-start;gap:8px;margin:0 0 10px;max-width:820px">
         <input id="ws-pr-toggle" type="checkbox" ${wsPr.enabled ? 'checked' : ''}>

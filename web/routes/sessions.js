@@ -144,7 +144,7 @@ function buildList(root, list, qs) {
             return `
             <tr data-project="${fmt.htmlSafe(proj)}" data-started="${s.started || ''}" data-turns="${s.turns || 0}" data-tokens="${s.tokens || 0}" data-cost="${s.cost_usd ?? ''}" data-cost-est="${s.cost_estimated ? '1' : ''}" data-session="${fmt.htmlSafe(s.session_id || '')}">
               <td class="mono" data-val="${s.started || ''}">${fmt.ts(s.started)}</td>
-              <td class="blur-sensitive" data-val="${fmt.htmlSafe(proj)}">${workspaceLabel(proj, s.workspace_path)}</td>
+              <td class="blur-sensitive" data-val="${fmt.htmlSafe(proj)}">${workspaceLabel(proj, s.workspace_path, { prNumber: s.pr_number, prUrl: s.pr_url })}</td>
               <td class="num" data-val="${s.turns || 0}">${fmt.int(s.turns)}</td>
               <td class="num" data-val="${s.tokens || 0}">${fmt.int(s.tokens)}</td>
               <td class="num blur-sensitive" data-val="${s.cost_usd ?? ''}">${s.cost_usd == null ? '<span class="muted">—</span>' : fmt.usd(s.cost_usd)}${s.cost_estimated ? '<span class="muted" title="pricing estimated from model tier">*</span>' : ''}</td>

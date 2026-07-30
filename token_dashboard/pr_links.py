@@ -1,7 +1,7 @@
 """Associate workspace directories with GitHub pull requests.
 
 Off by default. When the ``workspace_pr_links`` setting is on, each workspace
-directory is resolved to a label like ``bike_index: PR #4021 - Fix the thing``
+directory is resolved to a label like ``bike_index: #4021 - Fix the thing``
 so tables show what the work *was* instead of a directory codename — the
 motivating case is git-worktree tooling (Conductor et al.) that names
 worktrees ``dubai-v3``, ``nukualofa``, ``amsterdam``.
@@ -13,7 +13,7 @@ that renders a page is a plain SELECT and never shells out.
 Labels, in precedence order:
 
     main worktree              ``{repo}: main worktree``
-    branch with a PR           ``{repo}: PR #{number} - {title}``
+    branch with a PR           ``{repo}: #{number} - {title}``
     linked worktree, no PR     ``{repo}: {branch}``
     not a git repo             no label (caller keeps the existing name)
 
@@ -190,7 +190,9 @@ def build_label(info: Optional[dict], pr: Optional[dict]) -> Optional[str]:
         return f"{repo}: main worktree"
     if pr and pr.get("number"):
         title = pr.get("title") or ""
-        return f"{repo}: PR #{pr['number']} - {title}" if title else f"{repo}: PR #{pr['number']}"
+        # Bare "#123", not "PR #123" — the frontend turns the number into a
+        # link to the PR, so the word would just be noise.
+        return f"{repo}: #{pr['number']} - {title}" if title else f"{repo}: #{pr['number']}"
     branch = info.get("branch")
     if branch:
         return f"{repo}: {branch}"

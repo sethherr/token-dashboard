@@ -419,36 +419,57 @@ hr.divider { border: 0; border-top: 1px solid var(--border); margin: 16px 0; }
 }
 
 /* ── Workspace labels ────────────────────────────────────────────────────────
-   With GitHub PR association on, a workspace's display name no longer says
-   where the work happened, so the path is always reachable: native tooltip on
-   hover (the title attribute) and a click/keyboard-toggled popover for touch
-   and for paths long enough that the OS tooltip truncates them. */
-.ws-label {
+   Every workspace name carries a "?" affordance showing the directory it
+   stands for — needed most when PR association is on and the name no longer
+   says where the work happened, but shown always so the control doesn't
+   appear and disappear between rows. Hover is pure CSS; .ws-open pins it
+   open on click. */
+.ws-cell { display: inline-flex; align-items: baseline; gap: 6px; max-width: 100%; }
+.ws-name { min-width: 0; }
+
+.ws-pr { color: var(--accent); text-decoration: none; font-variant-numeric: tabular-nums; }
+.ws-pr:hover { text-decoration: underline; }
+
+.ws-info {
+  flex: none;
   position: relative;
-  cursor: help;
-  border-bottom: 1px dotted var(--border-2);
+  width: 14px;
+  height: 14px;
+  padding: 0;
+  border: 1px solid var(--border-2);
+  border-radius: 50%;
+  background: transparent;
+  color: var(--muted, #8B949E);
+  font: 600 9px/1 var(--mono);
+  cursor: pointer;
+  align-self: center;
 }
-.ws-label:focus-visible {
-  outline: 2px solid var(--accent, #58a6ff);
-  outline-offset: 2px;
-}
-.ws-label.ws-open::after {
+.ws-info:hover, .ws-info.ws-open { color: var(--text); border-color: var(--accent); }
+.ws-info:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+.ws-info::after {
   content: attr(data-ws-path);
   position: absolute;
-  left: 0;
-  top: calc(100% + 6px);
-  z-index: 40;
-  max-width: min(640px, 80vw);
+  left: 50%;
+  top: calc(100% + 7px);
+  transform: translateX(-50%);
+  z-index: 60;
+  width: max-content;
+  max-width: min(560px, 70vw);
   white-space: pre-wrap;
   word-break: break-all;
-  background: var(--panel-2, #0F1419);
-  color: var(--text, #E6EDF3);
-  border: 1px solid var(--border-2, #283040);
+  text-align: left;
+  background: var(--panel-2);
+  color: var(--text);
+  border: 1px solid var(--border-2);
   border-radius: 6px;
   padding: 6px 9px;
-  font-family: var(--mono);
-  font-size: 11px;
-  line-height: 1.45;
-  font-weight: 400;
+  font: 400 11px/1.45 var(--mono);
   box-shadow: 0 6px 18px rgba(0, 0, 0, 0.45);
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
 }
+.ws-info:hover::after,
+.ws-info:focus-visible::after,
+.ws-info.ws-open::after { opacity: 1; visibility: visible; }

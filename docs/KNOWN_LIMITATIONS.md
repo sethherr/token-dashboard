@@ -73,8 +73,8 @@ resolve and 272 get a PR number. What remains is genuinely unresolvable:
   nothing.
 
 Those workspaces keep their directory-derived name, which is the honest
-answer. Nothing is ever lost — a label only replaces a directory name that
-stays visible in the hover/click tooltip.
+answer. Nothing is ever lost — a label only replaces a directory name that stays
+visible behind the `?` icon every workspace name carries.
 
 Two operational bounds:
 

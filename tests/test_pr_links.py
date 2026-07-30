@@ -126,11 +126,11 @@ class LabelTests(unittest.TestCase):
     def test_pr_label(self):
         info = {"repo": "widgets", "is_main": False, "branch": "f/x"}
         pr = {"number": 42, "title": "Add the thing"}
-        self.assertEqual(P.build_label(info, pr), "widgets: PR #42 - Add the thing")
+        self.assertEqual(P.build_label(info, pr), "widgets: #42 - Add the thing")
 
     def test_pr_without_title_omits_the_dash(self):
         info = {"repo": "widgets", "is_main": False, "branch": "f/x"}
-        self.assertEqual(P.build_label(info, {"number": 7, "title": ""}), "widgets: PR #7")
+        self.assertEqual(P.build_label(info, {"number": 7, "title": ""}), "widgets: #7")
 
     def test_worktree_without_pr_falls_back_to_branch(self):
         info = {"repo": "widgets", "is_main": False, "branch": "f/x"}
@@ -161,7 +161,7 @@ class ResolveWorkspaceTests(unittest.TestCase):
         responses = dict(LINKED)
         responses["pr list"] = '[{"number": 9, "title": "Fix it", "state": "OPEN", "url": "u"}]'
         row = P.resolve_workspace("/wt", git_bin="git", gh_bin="gh", runner=fake_runner(responses))
-        self.assertEqual(row["label"], "widgets: PR #9 - Fix it")
+        self.assertEqual(row["label"], "widgets: #9 - Fix it")
         self.assertEqual(row["pr_number"], 9)
 
     def test_vanished_workspace_yields_no_label(self):
@@ -313,7 +313,7 @@ class ResolveAllTests(unittest.TestCase):
         )
         by_path = {r["path"]: r for r in rows}
         self.assertEqual(by_path[self.DEAD]["label"],
-                         "widgets: PR #3850 - Add redesigned registration flow")
+                         "widgets: #3850 - Add redesigned registration flow")
         self.assertEqual(by_path[self.DEAD]["pr_state"], "MERGED")
         self.assertEqual(by_path[self.DEAD]["inferred"], 1, "repo came from a sibling")
         self.assertEqual(by_path[self.LIVE]["inferred"], 0)
@@ -474,7 +474,7 @@ class ResolveAllSearchTierTests(unittest.TestCase):
             git_bin="git", gh_bin="gh",
             runner=fake_runner({"search prs": hit}),
         )
-        self.assertEqual(rows[0]["label"], "binxtils: PR #23 - Bundle luxon")
+        self.assertEqual(rows[0]["label"], "binxtils: #23 - Bundle luxon")
         self.assertEqual(rows[0]["repo_slug"], "bikeindex/binxtils")
         self.assertEqual(rows[0]["inferred"], 1)
         self.assertEqual(stats["found_by_search"], 1)

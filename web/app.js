@@ -94,41 +94,61 @@ export function cacheClear()        { _cache.clear(); }
 
 // ── Workspace labels ──────────────────────────────────────────────────────────
 // A workspace is a directory an agent ran in. With PR association on, the
-// server rewrites the display name to "{repo}: PR #N - title", which hides
-// where the work actually happened — so the path is always available as a
-// tooltip, on hover and on click.
+// display name becomes "{repo}: #123 - title", which says nothing about where
+// the work happened — so every workspace name gets a "?" affordance showing
+// its path, on hover and on click, whether or not it resolved to a PR.
 
-/** Inner HTML for a workspace name plus its path tooltip. */
-export function workspaceLabel(name, path, { className = '' } = {}) {
-  const label = fmt.htmlSafe(name ?? '');
-  if (!path) return className ? `<span class="${className}">${label}</span>` : label;
+const GITHUB_PR_URL = /^https:\/\/github\.com\/[^/]+\/[^/]+\/pull\/\d+$/;
+
+/**
+ * Markup for a workspace name plus its path affordance.
+ * @param {string} name   display name (already PR-labelled server-side, or the directory name)
+ * @param {string} path   workspace directory, shown in the tooltip
+ * @param {object} opts   {className, prNumber, prUrl}
+ */
+export function workspaceLabel(name, path, { className = '', prNumber, prUrl } = {}) {
+  let label = fmt.htmlSafe(name ?? '');
+
+  // Turn the "#123" the server put in the label into a link to the PR. Done
+  // after escaping and against the literal token, so a hostile PR title can't
+  // introduce markup — and only for a real github.com pull URL.
+  if (prNumber && prUrl && GITHUB_PR_URL.test(prUrl)) {
+    const token = '#' + prNumber;
+    const at = label.indexOf(token);
+    if (at !== -1) {
+      const anchor = `<a href="${fmt.htmlSafe(prUrl)}" target="_blank" rel="noopener noreferrer"`
+        + ` class="ws-pr" title="Open pull request #${prNumber} on GitHub">${token}</a>`;
+      label = label.slice(0, at) + anchor + label.slice(at + token.length);
+    }
+  }
+
+  if (!path) return `<span class="ws-cell ${className}">${label}</span>`;
   const safePath = fmt.htmlSafe(path);
-  return `<span class="ws-label ${className}" tabindex="0" role="button"
-    aria-label="${label} — ${safePath}" title="${safePath}"
-    data-ws-path="${safePath}">${label}</span>`;
+  return `<span class="ws-cell ${className}"><span class="ws-name">${label}</span>`
+    + `<button type="button" class="ws-info" data-ws-path="${safePath}"`
+    + ` aria-label="Workspace path: ${safePath}">?</button></span>`;
 }
 
-/** Click-to-reveal for workspace paths. Hover is handled by the title attribute. */
+/** Click-to-pin for the path tooltip. Hover is pure CSS. */
 export function bindWorkspaceTooltips(root = document) {
-  root.querySelectorAll('.ws-label[data-ws-path]').forEach(el => {
+  root.querySelectorAll('.ws-info[data-ws-path]').forEach(el => {
     if (el.dataset.wsBound) return;
     el.dataset.wsBound = '1';
-    const toggle = e => {
+    el.addEventListener('click', e => {
       e.stopPropagation();
+      e.preventDefault();
       const open = el.classList.contains('ws-open');
-      root.querySelectorAll('.ws-label.ws-open').forEach(o => o.classList.remove('ws-open'));
+      document.querySelectorAll('.ws-info.ws-open').forEach(o => o.classList.remove('ws-open'));
       if (!open) el.classList.add('ws-open');
-    };
-    el.addEventListener('click', toggle);
+    });
     el.addEventListener('keydown', e => {
-      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); toggle(e); }
       if (e.key === 'Escape') el.classList.remove('ws-open');
     });
   });
   if (!document.body.dataset.wsDismissBound) {
     document.body.dataset.wsDismissBound = '1';
     document.addEventListener('click', () => {
-      document.querySelectorAll('.ws-label.ws-open').forEach(o => o.classList.remove('ws-open'));
+      document.querySelectorAll('.ws-info.ws-open').forEach(o => o.classList.remove('ws-open'));
     });
   }
 }

@@ -453,8 +453,24 @@ def _top_up_workspace_prs(db_path: str, resolver=None, now=None) -> dict:
     return {**stats, "pending": max(0, len(paths) - len(capped))}
 
 
+def _workspace_label(info: dict) -> Optional[str]:
+    """Render a cached workspace row for display.
+
+    Rebuilt from the stored parts rather than reusing the stored ``label``
+    string, so a change to the label format takes effect on the next page
+    load instead of requiring everyone to re-run a network refresh.
+    """
+    pr = None
+    if info.get("pr_number"):
+        pr = {"number": info["pr_number"], "title": info.get("pr_title")}
+    return pr_links.build_label(
+        {"repo": info.get("repo"), "is_main": info.get("is_main"), "branch": info.get("branch")},
+        pr,
+    )
+
+
 def _apply_workspace_labels(db_path: str, payload, name_keys=("project_name",),
-                            path_key: str = "workspace_path"):
+                            path_key: str = "workspace_path", field_prefix: str = ""):
     """Swap workspace display names for their GitHub PR label, in place.
 
     A no-op unless the setting is on and the workspace has a cached label, so
@@ -474,17 +490,19 @@ def _apply_workspace_labels(db_path: str, payload, name_keys=("project_name",),
         if not isinstance(row, dict):
             return
         info = labels.get(row.get(path_key))
-        if not info or not info.get("label"):
+        if not info:
+            return
+        label = _workspace_label(info)
+        if not label:
             return
         for key in name_keys:
             if key in row and row[key]:
                 row.setdefault(f"{key}_original", row[key])
-                row[key] = info["label"]
-        row["pr_number"] = info.get("pr_number")
-        row["pr_title"] = info.get("pr_title")
-        row["pr_url"] = info.get("pr_url")
-        row["pr_state"] = info.get("pr_state")
-        row["repo"] = info.get("repo")
+                row[key] = label
+        # Prefixed because a row can name two workspaces (cross-workspace
+        # leaks name a source and a target); unprefixed they'd overwrite.
+        for field in ("pr_number", "pr_title", "pr_url", "pr_state", "repo"):
+            row[f"{field_prefix}{field}"] = info.get(field)
 
     if isinstance(payload, list):
         for row in payload:
@@ -508,15 +526,16 @@ def _apply_sankey_labels(db_path: str, matrix: dict) -> dict:
     rename: dict = {}
     for node in matrix.get("nodes") or []:
         info = labels.get(node.get("workspace_path"))
-        if not info or not info.get("label"):
+        label = _workspace_label(info) if info else None
+        if not label:
             continue
         name = node.get("name") or ""
         for suffix in (" (agent)", " (files)"):
             if name.endswith(suffix):
-                new = f"{info['label']}{suffix}"
+                new = f"{label}{suffix}"
                 break
         else:
-            new = info["label"]
+            new = label
         if new != name:
             rename[name] = new
             node["name_original"] = name
@@ -745,8 +764,8 @@ def build_handler(db_path: str, projects_dir: Optional[str] = None):
                     since=since, until=until,
                 )
                 # Each leak row names two workspaces, so relabel both sides.
-                _apply_workspace_labels(db_path, data, ("source",), "source_path")
-                _apply_workspace_labels(db_path, data, ("target",), "target_path")
+                _apply_workspace_labels(db_path, data, ("source",), "source_path", "source_")
+                _apply_workspace_labels(db_path, data, ("target",), "target_path", "target_")
                 _cache_set(cache_key, data)
                 return _send_json(self, data)
             if path == "/api/subagents":
