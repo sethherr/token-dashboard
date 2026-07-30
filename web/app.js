@@ -330,6 +330,10 @@ function setActiveTab(routeKey) {
 // from overwriting DOM that a newer render() already populated.
 let _renderGen = 0;
 
+// Fades in after a beat, so quick routes never flash it.
+const SPINNER = '<div class="route-loading" role="status" aria-live="polite">'
+  + '<div class="spinner"></div><span>Loading…</span></div>';
+
 async function render() {
   const gen = ++_renderGen;
   const hash = location.hash.replace(/^#/, '') || '/overview';
@@ -338,16 +342,25 @@ async function render() {
   if (path.startsWith('/sessions/')) key = '/sessions';
   setActiveTab(key);
   const loader = ROUTES[key] || ROUTES['/overview'];
+
+  // Every render owns a container of its own. A route that finishes fetching
+  // after the user has clicked away still writes into it, but by then it has
+  // been detached — so a slow page can never paint over the one on screen.
+  disposeMountedCharts();  // dispose all live ECharts instances before clearing DOM
+  const view = document.createElement('div');
+  view.innerHTML = SPINNER;
+  $('#app').replaceChildren(view);
+
   const mod = await loader();
   if (gen !== _renderGen) return; // a newer render() won the race — bail out
-  disposeMountedCharts();         // dispose all live ECharts instances before clearing DOM
-  $('#app').innerHTML = '';
   try {
-    await mod.default($('#app'));
+    await mod.default(view);
   } catch (e) {
-    $('#app').innerHTML = `<div class="card"><h2>Error</h2><pre>${fmt.htmlSafe(String(e.stack || e))}</pre></div>`;
+    if (gen !== _renderGen) return;
+    view.innerHTML = `<div class="card"><h2>Error</h2><pre>${fmt.htmlSafe(String(e.stack || e))}</pre></div>`;
   }
-  enhanceTables($('#app'));
+  if (gen !== _renderGen) return;
+  enhanceTables(view);
 }
 
 async function firstRun() {

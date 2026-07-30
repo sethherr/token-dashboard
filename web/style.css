@@ -102,6 +102,23 @@ header.topbar {
 /* main */
 main#app { padding: 24px 20px; max-width: 1400px; margin: 0 auto; }
 
+/* route loading state — held back 150ms so fast pages never flash it */
+.route-loading {
+  display: flex; align-items: center; justify-content: center; gap: 10px;
+  padding: 80px 0; color: var(--muted); font-size: 13px;
+  opacity: 0; animation: route-loading-in 140ms ease-out 150ms forwards;
+}
+.route-loading .spinner {
+  width: 16px; height: 16px; border-radius: 50%;
+  border: 2px solid var(--border-2); border-top-color: var(--accent);
+  animation: spin 700ms linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+@keyframes route-loading-in { to { opacity: 1; } }
+@media (prefers-reduced-motion: reduce) {
+  .route-loading .spinner { animation: none; border-top-color: var(--border-2); }
+}
+
 /* card */
 .card {
   background: var(--panel);
