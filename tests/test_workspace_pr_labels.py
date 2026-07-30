@@ -113,71 +113,53 @@ class RefreshTests(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def test_refresh_stores_rows_and_counts(self):
-        def resolver(path, git_bin=None, gh_bin=None, allow_network=True):
-            live = path == "/live"
-            return {
-                "path": path, "repo": "widgets" if live else None, "repo_slug": None,
-                "branch": "b", "is_main": 0, "pr_number": 5 if live else None,
-                "pr_title": "t", "pr_url": "u", "pr_state": "OPEN",
-                "label": "widgets: PR #5 - t" if live else None,
-                "resolved": 1 if live else 0, "checked_at": 1.0,
-            }
+    def test_refresh_stores_rows_and_labels_apply(self):
+        def resolver(paths, recorded_branches=None, **kw):
+            rows = [{
+                "path": "/live", "repo": "widgets", "repo_slug": "acme/widgets",
+                "branch": "b", "is_main": 0, "pr_number": 5, "pr_title": "t",
+                "pr_url": "u", "pr_state": "MERGED", "label": "widgets: PR #5 - t",
+                "resolved": 1, "inferred": 0, "checked_at": 1.0,
+            }]
+            return rows, {"checked": len(paths), "resolved": 1, "with_pr": 1,
+                          "live": 1, "inferred": 0, "repos": 1, "bulk_prs": 3,
+                          "pr_lookups": 0, "throttled": 0}
 
         out = server._refresh_workspace_prs(self.db, paths=["/live", "/gone"], resolver=resolver)
         self.assertEqual(out["checked"], 2)
-        self.assertEqual(out["resolved"], 1)
         self.assertEqual(out["with_pr"], 1)
         set_setting(self.db, server.WORKSPACE_PR_SETTING, "1")
         rows = [{"project_name": "x", "workspace_path": "/live"}]
         server._apply_workspace_labels(self.db, rows)
         self.assertEqual(rows[0]["project_name"], "widgets: PR #5 - t")
 
-    def test_one_exploding_workspace_does_not_abort_the_rest(self):
-        def resolver(path, git_bin=None, gh_bin=None, allow_network=True):
-            if path == "/boom":
-                raise RuntimeError("git blew up")
-            return {"path": path, "label": "ok", "resolved": 1, "pr_number": 1,
-                    "repo": "r", "repo_slug": None, "branch": "b", "is_main": 0,
-                    "pr_title": "t", "pr_url": "u", "pr_state": "OPEN", "checked_at": 1.0}
+    def test_resolver_blowing_up_is_reported_not_raised(self):
+        def resolver(paths, **kw):
+            raise RuntimeError("gh exploded")
 
-        out = server._refresh_workspace_prs(self.db, paths=["/boom", "/fine"], resolver=resolver)
-        self.assertEqual(out["resolved"], 1)
+        out = server._refresh_workspace_prs(self.db, paths=["/a"], resolver=resolver)
+        self.assertIn("error", out)
+        self.assertEqual(out["with_pr"], 0)
 
-    def test_dead_paths_are_never_skipped_by_the_network_budget(self):
-        """Only PR lookups are budgeted — a deleted worktree costs nothing."""
-        paths = [f"/w{i}" for i in range(server.MAX_WORKSPACE_PR_LOOKUPS + 50)]
-        seen = []
+    def test_recorded_branches_are_passed_through(self):
+        """The transcript-derived branches are what make dead worktrees resolvable."""
+        from token_dashboard.db import connect
+        with connect(self.db) as c:
+            c.execute(
+                "INSERT INTO messages (uuid, session_id, project_slug, cwd, git_branch, type, timestamp) "
+                "VALUES (?,?,?,?,?,?,?)",
+                ("m1", "s1", "-home-x-proj", "/home/x/proj", "feature/x", "user",
+                 "2026-05-01T00:00:00Z"),
+            )
+            c.commit()
+        seen = {}
 
-        def resolver(path, git_bin=None, gh_bin=None, allow_network=True):
-            seen.append(path)
-            return {"path": path, "label": None, "resolved": 0, "pr_number": None,
-                    "repo": None, "repo_slug": None, "branch": None, "is_main": 0,
-                    "pr_title": None, "pr_url": None, "pr_state": None, "checked_at": 1.0}
+        def resolver(paths, recorded_branches=None, **kw):
+            seen.update(recorded_branches or {})
+            return [], {"checked": 0, "resolved": 0, "with_pr": 0}
 
-        out = server._refresh_workspace_prs(self.db, paths=paths, resolver=resolver)
-        self.assertEqual(len(seen), len(paths), "every path inspected")
-        self.assertEqual(out["skipped"], 0)
-        self.assertEqual(out["throttled"], 0)
-
-    def test_network_budget_throttles_live_worktrees_and_reports_it(self):
-        n = server.MAX_WORKSPACE_PR_LOOKUPS + 7
-        allowed = []
-
-        def resolver(path, git_bin=None, gh_bin=None, allow_network=True):
-            allowed.append(allow_network)
-            return {"path": path, "label": "r: b", "resolved": 1,
-                    "pr_number": 1 if allow_network else None,
-                    "repo": "r", "repo_slug": "o/r", "branch": "b", "is_main": 0,
-                    "pr_title": "t", "pr_url": "u", "pr_state": "OPEN", "checked_at": 1.0}
-
-        out = server._refresh_workspace_prs(
-            self.db, paths=[f"/w{i}" for i in range(n)], resolver=resolver)
-        self.assertEqual(sum(1 for a in allowed if a), server.MAX_WORKSPACE_PR_LOOKUPS)
-        self.assertEqual(out["pr_lookups"], server.MAX_WORKSPACE_PR_LOOKUPS)
-        self.assertEqual(out["throttled"], 7)
-        # Throttled workspaces still get a local label, just no PR number.
-        self.assertEqual(out["resolved"], n)
+        server._refresh_workspace_prs(self.db, paths=["/home/x/proj"], resolver=resolver)
+        self.assertEqual(seen.get("/home/x/proj"), "feature/x")
 
 
 class SettingsPayloadTests(unittest.TestCase):
@@ -204,3 +186,116 @@ class SettingsPayloadTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TopUpTests(unittest.TestCase):
+    """A normal refresh fills in PR links without pressing 'Refresh PR links'."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.db = os.path.join(self.tmp, "w.db")
+        init_db(self.db)
+        set_setting(self.db, server.WORKSPACE_PR_SETTING, "1")
+        from token_dashboard.db import connect
+        with connect(self.db) as c:
+            for i, (slug, cwd, branch) in enumerate([
+                ("-ws-repo-alpha", "/ws/repo/alpha", "feature/a"),
+                ("-ws-repo-beta", "/ws/repo/beta", "feature/b"),
+            ]):
+                c.execute(
+                    "INSERT INTO messages (uuid, session_id, project_slug, cwd, git_branch, "
+                    "type, timestamp) VALUES (?,?,?,?,?,?,?)",
+                    (f"m{i}", f"s{i}", slug, cwd, branch, "user", "2026-05-01T00:00:00Z"),
+                )
+            c.commit()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _resolver(self, seen):
+        def resolver(paths, recorded_branches=None, **kw):
+            seen.extend(paths)
+            rows = [{
+                "path": p, "repo": "widgets", "repo_slug": "acme/widgets", "branch": "b",
+                "is_main": 0, "pr_number": 1, "pr_title": "t", "pr_url": "u",
+                "pr_state": "OPEN", "label": "widgets: PR #1 - t", "resolved": 1,
+                "inferred": 0, "checked_at": 1000.0,
+            } for p in paths]
+            return rows, {"checked": len(paths), "resolved": len(rows), "with_pr": len(rows)}
+        return resolver
+
+    def test_never_checked_workspaces_are_resolved(self):
+        seen = []
+        out = server._top_up_workspace_prs(self.db, resolver=self._resolver(seen))
+        self.assertEqual(sorted(seen), ["/ws/repo/alpha", "/ws/repo/beta"])
+        self.assertEqual(out["with_pr"], 2)
+
+    def test_steady_state_costs_nothing(self):
+        seen = []
+        server._top_up_workspace_prs(self.db, resolver=self._resolver(seen))
+        seen.clear()
+        out = server._top_up_workspace_prs(self.db, resolver=self._resolver(seen))
+        self.assertEqual(seen, [], "already linked — no further lookups")
+        self.assertEqual(out["checked"], 0)
+
+    def test_disabled_setting_is_a_no_op(self):
+        set_setting(self.db, server.WORKSPACE_PR_SETTING, "0")
+        seen = []
+        out = server._top_up_workspace_prs(self.db, resolver=self._resolver(seen))
+        self.assertEqual(seen, [])
+        self.assertEqual(out["skipped_reason"], "disabled")
+
+    def test_pr_less_workspace_is_rechecked_after_the_ttl(self):
+        """You often open the PR after starting work in the worktree."""
+        save_workspace_prs(self.db, [{
+            "path": "/ws/repo/alpha", "repo": "widgets", "repo_slug": "acme/widgets",
+            "branch": "feature/a", "is_main": 0, "pr_number": None, "pr_title": None,
+            "pr_url": None, "pr_state": None, "label": "widgets: feature/a",
+            "resolved": 1, "inferred": 0, "checked_at": 1000.0,
+        }])
+        seen = []
+        server._top_up_workspace_prs(self.db, resolver=self._resolver(seen), now=1001.0)
+        self.assertNotIn("/ws/repo/alpha", seen, "inside the recheck window")
+
+        seen.clear()
+        later = 1000.0 + server.WORKSPACE_PR_RECHECK_SECONDS + 1
+        server._top_up_workspace_prs(self.db, resolver=self._resolver(seen), now=later)
+        self.assertIn("/ws/repo/alpha", seen, "past the recheck window")
+
+    def test_unresolvable_workspaces_are_not_retried_forever(self):
+        save_workspace_prs(self.db, [{
+            "path": "/ws/repo/alpha", "repo": None, "repo_slug": None, "branch": None,
+            "is_main": 0, "pr_number": None, "pr_title": None, "pr_url": None,
+            "pr_state": None, "label": None, "resolved": 0, "inferred": 0,
+            "checked_at": 1.0,
+        }])
+        seen = []
+        server._top_up_workspace_prs(self.db, resolver=self._resolver(seen), now=1e9)
+        self.assertNotIn("/ws/repo/alpha", seen)
+
+    def test_main_worktrees_are_not_rechecked(self):
+        save_workspace_prs(self.db, [{
+            "path": "/ws/repo/alpha", "repo": "widgets", "repo_slug": "acme/widgets",
+            "branch": "main", "is_main": 1, "pr_number": None, "pr_title": None,
+            "pr_url": None, "pr_state": None, "label": "widgets: main worktree",
+            "resolved": 1, "inferred": 0, "checked_at": 1.0,
+        }])
+        seen = []
+        server._top_up_workspace_prs(self.db, resolver=self._resolver(seen), now=1e9)
+        self.assertNotIn("/ws/repo/alpha", seen)
+
+    def test_batch_is_capped_and_remainder_reported(self):
+        from token_dashboard.db import connect
+        with connect(self.db) as c:
+            for i in range(server.MAX_INCREMENTAL_PR_LOOKUPS + 4):
+                c.execute(
+                    "INSERT INTO messages (uuid, session_id, project_slug, cwd, git_branch, "
+                    "type, timestamp) VALUES (?,?,?,?,?,?,?)",
+                    (f"x{i}", "s", f"-ws-repo-w{i}", f"/ws/repo/w{i}", "b", "user",
+                     "2026-05-01T00:00:00Z"),
+                )
+            c.commit()
+        seen = []
+        out = server._top_up_workspace_prs(self.db, resolver=self._resolver(seen))
+        self.assertEqual(len(seen), server.MAX_INCREMENTAL_PR_LOOKUPS)
+        self.assertEqual(out["pending"], 6)  # 2 original + 29 new - 25 done

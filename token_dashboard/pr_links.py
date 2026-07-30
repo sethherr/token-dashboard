@@ -16,6 +16,17 @@ Labels, in precedence order:
     branch with a PR           ``{repo}: PR #{number} - {title}``
     linked worktree, no PR     ``{repo}: {branch}``
     not a git repo             no label (caller keeps the existing name)
+
+Most workspaces in a long history are *deleted* worktrees — the branch merged
+and the directory went away — so running git in them is impossible. They are
+still resolvable, because two facts survive:
+
+  * the branch, stamped on every transcript message as ``gitBranch``;
+  * the repo, inherited from sibling workspaces in the same parent directory
+    that *do* still exist (worktree tooling keeps one directory per repo).
+
+Given repo + branch, ``gh pr list --state all`` finds the merged PR. See
+``resolve_all``.
 """
 from __future__ import annotations
 
@@ -23,7 +34,7 @@ import json
 import re
 import subprocess
 import time
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Tuple
 
 from .binaries import find_executable
 
@@ -37,6 +48,16 @@ _AUTO = object()
 
 GIT_TIMEOUT = 5      # local disk reads
 GH_TIMEOUT = 20      # network round-trip to github.com
+GH_BULK_TIMEOUT = 120  # one call can page through hundreds of PRs
+
+# One bulk fetch per repo beats one query per branch: ~5s for 1000 PRs versus
+# ~0.5s x N. Branches not covered by the bulk window fall back to a targeted
+# query, bounded by the caller's lookup budget.
+DEFAULT_PR_FETCH = 1000
+
+# Branch names that are never a PR head worth attributing, and which collide
+# across repos — attributing one of these by inference would be a guess.
+GENERIC_BRANCHES = frozenset({"main", "master", "develop", "trunk", "HEAD"})
 
 # github.com:owner/name(.git) | github.com/owner/name(.git), ssh or https.
 _REMOTE_RE = re.compile(r"[:/]([^/:]+)/([^/]+?)(?:\.git)?/?$")
@@ -209,3 +230,266 @@ def resolve_workspace(path: str, git_bin=_AUTO, gh_bin=_AUTO,
         "resolved": 1 if info else 0,
         "checked_at": time.time(),
     }
+
+
+def fetch_repo_prs(repo_slug_: str, gh_bin=_AUTO, runner: Callable = _run,
+                   limit: int = DEFAULT_PR_FETCH) -> dict:
+    """``{head_branch: pr}`` for a repo, in one call.
+
+    Where a branch name was reused across PRs, the highest-numbered (most
+    recent) one wins — that's the PR the workspace most likely belonged to.
+    """
+    if not repo_slug_:
+        return {}
+    if gh_bin is _AUTO:
+        gh_bin = find_gh()
+    if not gh_bin:
+        return {}
+    out = runner([
+        gh_bin, "pr", "list",
+        "--repo", repo_slug_,
+        "--state", "all",
+        "--json", "number,title,state,url,headRefName",
+        "--limit", str(limit),
+    ], GH_BULK_TIMEOUT)
+    if not out:
+        return {}
+    try:
+        rows = json.loads(out)
+    except json.JSONDecodeError:
+        return {}
+    if not isinstance(rows, list):
+        return {}
+    index: dict = {}
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        head = row.get("headRefName")
+        number = row.get("number")
+        if not head or not number:
+            continue
+        prev = index.get(head)
+        if prev and prev["number"] >= number:
+            continue
+        index[head] = {
+            "number": int(number),
+            "title": str(row.get("title") or "").strip(),
+            "state": str(row.get("state") or "").strip(),
+            "url": str(row.get("url") or "").strip(),
+        }
+    return index
+
+
+def search_pr(branch: Optional[str], owners=(), gh_bin=_AUTO,
+              runner: Callable = _run) -> Optional[dict]:
+    """Find a PR by head branch across repos, via GitHub's search API.
+
+    The last resort for a workspace whose directory is gone *and* whose repo
+    can't be inferred from siblings. Unlike the other paths this doesn't need
+    to know the repo — the search result reports it, which also means the
+    answer is corroborated by GitHub rather than guessed.
+
+    Ambiguity is refused: if the branch name matches PRs in more than one
+    repo, we return nothing instead of picking one.
+    """
+    if not branch or branch in GENERIC_BRANCHES:
+        return None
+    if gh_bin is _AUTO:
+        gh_bin = find_gh()
+    if not gh_bin:
+        return None
+    args = [gh_bin, "search", "prs", "--head", branch,
+            "--json", "number,title,repository,state,url", "--limit", "5"]
+    for owner in owners:
+        args += ["--owner", owner]
+    out = runner(args, GH_TIMEOUT)
+    if not out:
+        return None
+    try:
+        rows = json.loads(out)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(rows, list) or not rows:
+        return None
+    rows = [r for r in rows if isinstance(r, dict) and r.get("number")]
+    if not rows:
+        return None
+    repos = {(r.get("repository") or {}).get("nameWithOwner") for r in rows}
+    repos.discard(None)
+    if len(repos) != 1:
+        return None  # same branch name in several repos — no way to choose
+    best = max(rows, key=lambda r: r["number"])
+    return {
+        "number": int(best["number"]),
+        "title": str(best.get("title") or "").strip(),
+        # search returns lowercase states ("merged"); pr list returns "MERGED".
+        "state": str(best.get("state") or "").strip().upper(),
+        "url": str(best.get("url") or "").strip(),
+        "repo_slug": repos.pop(),
+    }
+
+
+def _parent_dir(path: str) -> str:
+    trimmed = (path or "").rstrip("/\\")
+    sep = "\\" if "\\" in trimmed else "/"
+    return trimmed.rsplit(sep, 1)[0] if sep in trimmed else ""
+
+
+def infer_repos_by_sibling(live_repos: dict) -> dict:
+    """``{parent_dir: repo_slug}`` for parents whose live children all agree.
+
+    Worktree tooling keeps one directory per repo
+    (``~/conductor/workspaces/<repo>/<workspace>``), so a deleted workspace's
+    repo is whatever its surviving siblings are. Unanimity is required: a
+    parent like ``~/Sites`` holding several unrelated projects yields nothing
+    rather than a guess.
+    """
+    by_parent: dict = {}
+    for path, slug in live_repos.items():
+        if not slug:
+            continue
+        by_parent.setdefault(_parent_dir(path), set()).add(slug)
+    return {parent: next(iter(slugs)) for parent, slugs in by_parent.items() if len(slugs) == 1}
+
+
+def _row(path, repo_slug_=None, branch=None, is_main=False, pr=None,
+         resolved=0, inferred=0) -> dict:
+    repo = repo_display(repo_slug_)
+    info = {"repo": repo, "is_main": is_main, "branch": branch}
+    return {
+        "path": path,
+        "repo": repo,
+        "repo_slug": repo_slug_,
+        "branch": branch,
+        "is_main": 1 if is_main else 0,
+        "pr_number": (pr or {}).get("number"),
+        "pr_title": (pr or {}).get("title"),
+        "pr_url": (pr or {}).get("url"),
+        "pr_state": (pr or {}).get("state"),
+        "label": build_label(info, pr),
+        "resolved": resolved,
+        "inferred": inferred,
+        "checked_at": time.time(),
+    }
+
+
+def resolve_all(paths, recorded_branches=None, git_bin=_AUTO, gh_bin=_AUTO,
+                runner: Callable = _run, bulk_limit: int = DEFAULT_PR_FETCH,
+                max_lookups: int = 200, max_searches: int = 100) -> Tuple[List[dict], dict]:
+    """Resolve every workspace path, including ones no longer on disk.
+
+    Four phases, cheapest first:
+
+    1. **git**, for paths that still exist — repo, branch, main-vs-linked.
+    2. **inference**, for paths that don't — branch from the transcripts,
+       repo from unanimous live siblings under the same parent directory.
+    3. **one bulk PR fetch per repo**, matched against branches offline.
+    4. **targeted PR queries** for branches the bulk window missed, bounded
+       by ``max_lookups``.
+    5. **cross-repo search** for workspaces with a branch but no repo at all
+       (no live siblings to inherit from), bounded by ``max_searches``. The
+       search reports the repo, so nothing here is guessed.
+
+    ``bulk_limit=0`` skips phase 3 entirely — right for incremental top-ups of
+    a handful of workspaces, where fetching a repo's whole PR list would cost
+    far more than querying each branch.
+
+    Returns ``(rows, stats)``.
+    """
+    recorded = dict(recorded_branches or {})
+    if git_bin is _AUTO:
+        git_bin = find_git()
+    if gh_bin is _AUTO:
+        gh_bin = find_gh()
+    paths = list(paths)
+
+    # ── 1. local git ─────────────────────────────────────────────────────────
+    live: dict = {}
+    for path in paths:
+        info = inspect_workspace(path, git_bin=git_bin, runner=runner)
+        if info:
+            live[path] = info
+
+    # ── 2. inference for the rest ────────────────────────────────────────────
+    sibling_repo = infer_repos_by_sibling({p: i.get("repo_slug") for p, i in live.items()})
+    plan: dict = {}
+    for path in paths:
+        info = live.get(path)
+        if info:
+            plan[path] = {
+                "repo_slug": info.get("repo_slug"),
+                "branch": info.get("branch") or recorded.get(path),
+                "is_main": info.get("is_main"),
+                "resolved": 1,
+                "inferred": 0,
+            }
+            continue
+        branch = recorded.get(path)
+        slug = sibling_repo.get(_parent_dir(path))
+        if not branch or not slug or branch in GENERIC_BRANCHES:
+            plan[path] = {"repo_slug": None, "branch": branch, "is_main": False,
+                          "resolved": 0, "inferred": 0}
+            continue
+        plan[path] = {"repo_slug": slug, "branch": branch, "is_main": False,
+                      "resolved": 1, "inferred": 1}
+
+    # ── 3. one bulk PR index per repo ────────────────────────────────────────
+    wanted_repos = {
+        p["repo_slug"] for p in plan.values()
+        if p["repo_slug"] and p["branch"] and not p["is_main"]
+    }
+    indexes: dict = {}
+    if bulk_limit > 0:
+        for slug in sorted(wanted_repos):
+            indexes[slug] = fetch_repo_prs(slug, gh_bin=gh_bin, runner=runner, limit=bulk_limit)
+
+    # ── 4. targeted lookups for what the bulk window missed ──────────────────
+    owners = sorted({slug.split("/")[0] for slug in wanted_repos if "/" in slug})
+    rows, lookups, throttled, searches, searched_ok = [], 0, 0, 0, 0
+    # Same branch in the same unknown repo appears under several workspaces;
+    # search once and reuse.
+    search_cache: dict = {}
+    for path in paths:
+        p = plan[path]
+        pr = None
+        repo_slug_ = p["repo_slug"]
+        resolved, inferred = p["resolved"], p["inferred"]
+        if repo_slug_ and p["branch"] and not p["is_main"]:
+            pr = indexes.get(repo_slug_, {}).get(p["branch"])
+            if pr is None:
+                if lookups < max_lookups:
+                    lookups += 1
+                    pr = find_pr(repo_slug_, p["branch"], gh_bin=gh_bin, runner=runner)
+                else:
+                    throttled += 1
+        elif not repo_slug_ and p["branch"] and p["branch"] not in GENERIC_BRANCHES:
+            # No repo to query — ask GitHub which repo this branch belongs to.
+            branch = p["branch"]
+            if branch in search_cache:
+                pr = search_cache[branch]
+            elif searches < max_searches:
+                searches += 1
+                pr = search_pr(branch, owners=owners, gh_bin=gh_bin, runner=runner)
+                search_cache[branch] = pr
+            else:
+                throttled += 1
+            if pr:
+                repo_slug_ = pr.get("repo_slug") or repo_slug_
+                resolved, inferred = 1, 1
+                searched_ok += 1
+        rows.append(_row(path, repo_slug_, p["branch"], p["is_main"], pr,
+                         resolved=resolved, inferred=inferred))
+    stats = {
+        "checked": len(paths),
+        "live": len(live),
+        "inferred": sum(1 for r in rows if r["inferred"]),
+        "resolved": sum(1 for r in rows if r["resolved"]),
+        "with_pr": sum(1 for r in rows if r["pr_number"]),
+        "repos": len(indexes),
+        "bulk_prs": sum(len(i) for i in indexes.values()),
+        "pr_lookups": lookups,
+        "searches": searches,
+        "found_by_search": searched_ok,
+        "throttled": throttled,
+    }
+    return rows, stats

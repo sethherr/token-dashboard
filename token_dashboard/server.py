@@ -19,6 +19,7 @@ from . import pr_links
 from .db import (
     clear_scan_data, default_claude_dir, get_setting, set_setting,
     workspace_pr_map, save_workspace_prs, workspace_root_paths, clear_workspace_prs,
+    workspace_branches, workspace_paths_needing_pr_refresh,
     overview_totals, expensive_prompts, project_summary,
     tool_token_breakdown, recent_sessions, session_turns,
     session_model_tokens,
@@ -138,6 +139,7 @@ def _do_refresh(db_path: str, projects_dir: str, pricing: dict) -> None:
         return
     try:
         n = scan_dir(_projects_dir(db_path, projects_dir), db_path)
+        _top_up_workspace_prs(db_path)
         _cache_clear()
         _publish_event({"type": "scan", "n": n, "ts": time.time()})
     except Exception as e:
@@ -377,17 +379,21 @@ def _validate_claude_dir(raw) -> Tuple[Optional[Path], Optional[str]]:
     return path, None
 
 
-# Budget the expensive thing — the GitHub round-trip — rather than the number
-# of workspaces. Most historical workspaces are deleted worktrees that fail a
-# local `git rev-parse` in milliseconds, so capping total paths would skip
-# live ones to save time we were never going to spend.
+# Budget the expensive thing — targeted GitHub round-trips. Bulk PR fetches
+# are one call per repo regardless of how many workspaces map to it.
 MAX_WORKSPACE_PR_LOOKUPS = 200
 MAX_WORKSPACE_PATHS = 5000  # runaway guard only
 
 
 def _refresh_workspace_prs(db_path: str, paths=None, resolver=None) -> dict:
-    """Resolve every known workspace to its repo/PR and cache the result."""
-    resolver = resolver or pr_links.resolve_workspace
+    """Resolve every known workspace to its repo/PR and cache the result.
+
+    Deleted worktrees are resolved too: the branch comes from the transcripts
+    (``messages.git_branch``) and the repo from surviving sibling workspaces,
+    so a merged-and-deleted branch still finds its PR. See
+    ``pr_links.resolve_all``.
+    """
+    resolver = resolver or pr_links.resolve_all
     paths = list(paths if paths is not None else workspace_root_paths(db_path))
     truncated = 0
     if len(paths) > MAX_WORKSPACE_PATHS:
@@ -395,34 +401,56 @@ def _refresh_workspace_prs(db_path: str, paths=None, resolver=None) -> dict:
         paths = paths[:MAX_WORKSPACE_PATHS]
     git_bin = pr_links.find_git()
     gh_bin = pr_links.find_gh()
-    rows = []
-    lookups = 0
-    throttled = 0
-    for path in paths:
-        allow = lookups < MAX_WORKSPACE_PR_LOOKUPS
-        try:
-            row = resolver(path, git_bin=git_bin, gh_bin=gh_bin, allow_network=allow)
-        except Exception:
-            continue  # one bad workspace shouldn't abort the whole refresh
-        rows.append(row)
-        # Paths ordered busiest-first, so if the budget runs out the workspaces
-        # that lose their PR number are the ones you look at least.
-        if row.get("resolved") and not row.get("is_main") and row.get("branch"):
-            if allow:
-                lookups += 1
-            else:
-                throttled += 1
+    try:
+        rows, stats = resolver(
+            paths,
+            recorded_branches=workspace_branches(db_path),
+            git_bin=git_bin, gh_bin=gh_bin,
+            max_lookups=MAX_WORKSPACE_PR_LOOKUPS,
+        )
+    except Exception as e:
+        return {"checked": 0, "resolved": 0, "with_pr": 0, "error": str(e),
+                "gh_available": bool(gh_bin), "git_available": bool(git_bin)}
     save_workspace_prs(db_path, rows)
-    return {
-        "checked": len(paths),
-        "resolved": sum(1 for r in rows if r.get("resolved")),
-        "with_pr": sum(1 for r in rows if r.get("pr_number")),
-        "pr_lookups": lookups,
-        "throttled": throttled,
-        "skipped": truncated,
-        "gh_available": bool(gh_bin),
-        "git_available": bool(git_bin),
-    }
+    return {**stats, "skipped": truncated,
+            "gh_available": bool(gh_bin), "git_available": bool(git_bin)}
+
+
+# A workspace usually gets its PR after work has already started, so a
+# PR-less workspace is re-checked periodically rather than once.
+WORKSPACE_PR_RECHECK_SECONDS = 900.0
+MAX_INCREMENTAL_PR_LOOKUPS = 25
+
+
+def _top_up_workspace_prs(db_path: str, resolver=None, now=None) -> dict:
+    """Resolve workspaces whose PR link is missing, as part of a normal refresh.
+
+    Runs after every scan when the setting is on, so newly-created worktrees
+    (and workspaces that have since had a PR opened) pick up their label
+    without anyone pressing "Refresh PR links". Targeted queries only, and
+    capped — a scan must never turn into a long network stall.
+    """
+    if not workspace_pr_links_enabled(db_path):
+        return {"checked": 0, "skipped_reason": "disabled"}
+    now = time.time() if now is None else now
+    paths = workspace_paths_needing_pr_refresh(
+        db_path, recheck_before=now - WORKSPACE_PR_RECHECK_SECONDS)
+    if not paths:
+        return {"checked": 0}
+    capped = paths[:MAX_INCREMENTAL_PR_LOOKUPS]
+    resolver = resolver or pr_links.resolve_all
+    try:
+        rows, stats = resolver(
+            capped,
+            recorded_branches=workspace_branches(db_path),
+            git_bin=pr_links.find_git(), gh_bin=pr_links.find_gh(),
+            bulk_limit=0,  # a handful of paths: query branches, don't page whole repos
+            max_lookups=MAX_INCREMENTAL_PR_LOOKUPS,
+        )
+    except Exception as e:
+        return {"checked": 0, "error": str(e)}
+    save_workspace_prs(db_path, rows)
+    return {**stats, "pending": max(0, len(paths) - len(capped))}
 
 
 def _apply_workspace_labels(db_path: str, payload, name_keys=("project_name",),
@@ -899,7 +927,11 @@ def _scan_loop(db_path: str, projects_dir: Optional[str] = None, interval: float
             if SCAN_LOCK.acquire(blocking=False):
                 try:
                     n = scan_dir(_projects_dir(db_path, projects_dir), db_path)
-                    if n["messages"] > 0:
+                    # Top up PR links for workspaces that appeared (or had a PR
+                    # opened) since the last pass. A no-op when nothing is
+                    # missing, so the steady state costs no network calls.
+                    topped = _top_up_workspace_prs(db_path)
+                    if n["messages"] > 0 or topped.get("with_pr"):
                         _cache_clear()
                     # Emit the event even when messages == 0 so the frontend's
                     # "Getting latest data…" banner clears once the scan finishes.

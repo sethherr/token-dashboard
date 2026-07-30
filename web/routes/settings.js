@@ -52,7 +52,7 @@ export default async function (root) {
 
       <h3>Associate workspaces with GitHub PRs</h3>
       <p class="muted" style="margin:0 0 12px;max-width:820px">Off by default. When on, every workspace is relabelled <code>{repo}: PR #{number} - {title}</code> in Projects, Sessions and Workspaces, instead of showing the directory name. Useful when worktree tooling names directories things like <code>dubai-v3</code>. The main checkout shows <code>{repo}: main worktree</code>. Hover or click any workspace name to see its path.</p>
-      <p class="muted" style="margin:0 0 12px;max-width:820px">Uses your local <code>git</code> and <code>gh</code> CLIs. Only workspaces that still exist on disk can be resolved — worktrees deleted after a merge keep their directory-derived name.</p>
+      <p class="muted" style="margin:0 0 12px;max-width:820px">Uses your local <code>git</code> and <code>gh</code> CLIs. <strong>Deleted worktrees resolve too</strong> — the branch survives in the transcripts and GitHub keeps merged PRs, so directories that are long gone still get their PR title. Only detached-HEAD sessions and branches that never had a PR stay unlabelled. Normal refreshes fill in new workspaces automatically; the button below re-resolves everything.</p>
       <label class="muted" style="display:flex;align-items:flex-start;gap:8px;margin:0 0 10px;max-width:820px">
         <input id="ws-pr-toggle" type="checkbox" ${wsPr.enabled ? 'checked' : ''}>
         <span>Associate workspaces with GitHub PRs</span>
@@ -112,7 +112,8 @@ export default async function (root) {
       if (!r.ok) throw new Error(data.error || ('HTTP ' + r.status));
       cacheClear();  // cached table payloads still carry the old labels
       const note = data.checked == null ? null
-        : `Linked ${data.with_pr} PR${data.with_pr === 1 ? '' : 's'} across ${data.resolved} live workspace${data.resolved === 1 ? '' : 's'} (checked ${data.checked}).`;
+        : `Linked ${data.with_pr} PR${data.with_pr === 1 ? '' : 's'} across ${data.resolved} of ${data.checked} workspaces`
+          + (data.live != null ? ` (${data.live} still on disk, ${data.inferred || 0} resolved from history).` : '.');
       paintWsPr(data.workspace_prs, note);
     } catch (e) {
       wsPrRefresh.disabled = !wsPr.enabled;

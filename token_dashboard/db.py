@@ -168,6 +168,9 @@ CREATE TABLE IF NOT EXISTS workspace_prs (
   pr_state    TEXT,
   label       TEXT,
   resolved    INTEGER NOT NULL DEFAULT 0,
+  -- 1 when the repo came from sibling inference rather than a live checkout
+  -- (the branch is always a hard fact: git, or the transcript's gitBranch).
+  inferred    INTEGER NOT NULL DEFAULT 0,
   checked_at  REAL
 );
 """
@@ -189,6 +192,7 @@ def init_db(path: Union[str, Path]) -> None:
         _migrate_add_message_id(c)
         _migrate_add_attribution_skill(c)
         _migrate_add_tool_use_id(c)
+        _migrate_add_workspace_pr_inferred(c)
         c.executescript(SCHEMA)
 
 
@@ -251,6 +255,24 @@ def _migrate_add_attribution_skill(conn) -> None:
     if has_summary_meta:
         conn.execute("DELETE FROM summary_meta")
     conn.commit()
+
+
+def _migrate_add_workspace_pr_inferred(conn) -> None:
+    """Add workspace_prs.inferred for DBs written before deleted worktrees
+    could be resolved.
+
+    Additive only — existing rows default to 0 ("repo came from a live
+    checkout"), which is true of everything the earlier version could write.
+    A later refresh overwrites them anyway.
+    """
+    has_table = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='workspace_prs'"
+    ).fetchone()
+    if not has_table:
+        return
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(workspace_prs)")}
+    if "inferred" not in cols:
+        conn.execute("ALTER TABLE workspace_prs ADD COLUMN inferred INTEGER NOT NULL DEFAULT 0")
 
 
 def _migrate_add_tool_use_id(conn) -> None:
@@ -610,9 +632,34 @@ def workspace_root_paths(db_path) -> list:
     return [p for p, _ in sorted(counts.items(), key=lambda kv: -kv[1])]
 
 
+def workspace_branches(db_path) -> dict:
+    """``{workspace_root: branch}`` from the transcripts themselves.
+
+    Claude Code stamps ``gitBranch`` on every message, so the branch a
+    workspace was on outlives the directory. This is what makes deleted
+    worktrees resolvable: the checkout is gone, but we still know its branch
+    and GitHub still has the (merged) PR.
+
+    Where a workspace was used on several branches over its life, the most
+    recent one wins — that's the identity it ended up with.
+    """
+    out: dict = {}
+    with connect(db_path) as c:
+        for r in c.execute(
+            "SELECT cwd, project_slug, git_branch, MAX(timestamp) AS t FROM messages "
+            "WHERE cwd IS NOT NULL AND project_slug IS NOT NULL "
+            "  AND git_branch IS NOT NULL AND git_branch != '' "
+            "GROUP BY cwd, project_slug, git_branch ORDER BY t"
+        ):
+            root = _workspace_root_path(r["cwd"], r["project_slug"]) or r["cwd"]
+            if root:
+                out[root] = r["git_branch"]  # ordered by time; last write wins
+    return out
+
+
 _WORKSPACE_PR_COLS = (
     "path", "repo", "repo_slug", "branch", "is_main",
-    "pr_number", "pr_title", "pr_url", "pr_state", "label", "resolved", "checked_at",
+    "pr_number", "pr_title", "pr_url", "pr_state", "label", "resolved", "inferred", "checked_at",
 )
 
 
@@ -644,6 +691,42 @@ def workspace_pr_map(db_path) -> dict:
             return out  # table predates this feature; nothing cached yet
         for r in cur:
             out[r["path"]] = dict(r)
+    return out
+
+
+def workspace_paths_needing_pr_refresh(db_path, recheck_before: float = 0.0) -> list:
+    """Workspace paths whose PR association is missing or worth re-checking.
+
+    Two cases, both cheap to fix on a normal scan:
+
+    * **never checked** — a workspace that appeared since the last refresh;
+    * **checked, still no PR, and re-checkable** — you often start work in a
+      worktree and open the PR later, so a resolvable workspace without a PR
+      is re-checked once ``recheck_before`` has passed.
+
+    Deliberately excludes rows that never resolved (a deleted worktree with no
+    inferrable repo won't start resolving on its own) and main worktrees
+    (their label doesn't depend on a PR), so a steady state costs nothing.
+    """
+    known: dict = {}
+    with connect(db_path) as c:
+        try:
+            for r in c.execute("SELECT * FROM workspace_prs"):
+                known[r["path"]] = dict(r)
+        except sqlite3.OperationalError:
+            known = {}
+    out = []
+    for path in workspace_root_paths(db_path):
+        row = known.get(path)
+        if row is None:
+            out.append(path)
+            continue
+        if row.get("pr_number") or not row.get("resolved") or row.get("is_main"):
+            continue
+        if not row.get("branch"):
+            continue
+        if (row.get("checked_at") or 0) < recheck_before:
+            out.append(path)
     return out
 
 

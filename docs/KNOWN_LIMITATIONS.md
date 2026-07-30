@@ -43,25 +43,45 @@ The first `python3 cli.py scan` on a heavy user's machine can read tens of MB ac
 
 Both will fight over the SQLite file and you'll see inconsistent numbers and occasional `database is locked` errors. Only run one at a time. If you want to view the dashboard from a second device, use `HOST=0.0.0.0` on the one running machine and point the second device's browser at it.
 
-## Workspace PR association only covers worktrees that still exist
+## Workspace PR association: what can and can't be resolved
 
-The optional *associate workspaces with GitHub PRs* setting resolves a workspace
-by running `git` inside its directory. A worktree that has been deleted — the
-normal fate of a branch once it merges — can't report its branch, so there's
-nothing to match a PR against. Those workspaces keep their directory-derived
-name, which is the honest answer: the association is unknown, not absent.
+The optional *associate workspaces with GitHub PRs* setting resolves deleted
+worktrees as well as live ones. Two facts outlive the directory: the branch
+(Claude Code stamps `gitBranch` on every transcript message) and the PR
+(GitHub keeps merged PRs forever). Resolution tries, cheapest first:
 
-The practical effect on a long transcript history is that most historical
-workspaces stay unlabelled and recent, still-checked-out ones get PR titles.
-Nothing is lost — labels only ever replace a directory name that is still shown
-in the hover/click tooltip.
+1. **git**, for workspaces still on disk — repo, branch, main-vs-linked worktree.
+2. **sibling inference**, for deleted ones — the branch from the transcripts,
+   the repo inherited from surviving workspaces in the same parent directory.
+   Unanimity is required, so a parent like `~/Sites` holding several unrelated
+   projects yields nothing rather than a guess.
+3. **one bulk PR fetch per repo**, matched against branches offline.
+4. **targeted PR queries** for branches older than the bulk window.
+5. **cross-repo search** (`gh search prs --head`) for workspaces with no
+   inferrable repo. The search reports which repo the branch belongs to, so
+   this tier corroborates rather than guesses; a branch name matching PRs in
+   two repos is refused instead of picked.
 
-Two smaller bounds:
+On a real 313-workspace history where only 22 directories still exist, 310
+resolve and 272 get a PR number. What remains is genuinely unresolvable:
 
-- PR lookups hit the network, so a refresh resolves at most 200 of them
-  (workspaces are processed busiest-first; the rest still get
-  `{repo}: {branch}` from the local checkout). The response reports how many
-  were throttled.
-- Association is a point-in-time snapshot, refreshed only when you press
-  **Refresh PR links** or toggle the setting on. A PR retitled after that shows
-  its old title until the next refresh.
+- **detached HEAD** — the transcript recorded `HEAD`, not a branch name, so
+  there is nothing to match;
+- **branches that never had a PR** — local-only work;
+- **generic branch names** (`main`, `master`, `develop`) are deliberately not
+  attributed by inference: they exist in every repo, so a match would prove
+  nothing.
+
+Those workspaces keep their directory-derived name, which is the honest
+answer. Nothing is ever lost — a label only replaces a directory name that
+stays visible in the hover/click tooltip.
+
+Two operational bounds:
+
+- A full refresh is budgeted: at most 200 targeted PR queries and 100
+  searches, with the counts reported rather than silently dropped. Bulk
+  fetches are one call per repo regardless of workspace count.
+- Association is a point-in-time snapshot. Normal refreshes top up workspaces
+  that are missing a link (and re-check PR-less ones every 15 minutes), but a
+  PR *retitled* after it was linked keeps its old title until the next full
+  **Refresh PR links**.

@@ -235,3 +235,275 @@ class WorkspacePrStorageTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BulkFetchTests(unittest.TestCase):
+    PRS = ('[{"number": 10, "title": "Ten", "state": "MERGED", "url": "u10", "headRefName": "a"},'
+           ' {"number": 11, "title": "Eleven", "state": "OPEN", "url": "u11", "headRefName": "b"},'
+           ' {"number": 3,  "title": "Old",   "state": "CLOSED", "url": "u3", "headRefName": "a"}]')
+
+    def test_indexes_by_head_branch(self):
+        idx = P.fetch_repo_prs("a/b", gh_bin="gh", runner=fake_runner({"pr list": self.PRS}))
+        self.assertEqual(set(idx), {"a", "b"})
+        self.assertEqual(idx["b"]["number"], 11)
+
+    def test_reused_branch_keeps_the_newest_pr(self):
+        idx = P.fetch_repo_prs("a/b", gh_bin="gh", runner=fake_runner({"pr list": self.PRS}))
+        self.assertEqual(idx["a"]["number"], 10, "highest PR number wins for a reused branch")
+
+    def test_junk_and_missing_gh_degrade_to_empty(self):
+        for out in ("not json", '{"a": 1}', ""):
+            self.assertEqual(P.fetch_repo_prs("a/b", gh_bin="gh",
+                                              runner=fake_runner({"pr list": out})), {})
+        self.assertEqual(P.fetch_repo_prs("a/b", gh_bin=None, runner=fake_runner({})), {})
+        self.assertEqual(P.fetch_repo_prs("", gh_bin="gh", runner=fake_runner({})), {})
+
+
+class SiblingInferenceTests(unittest.TestCase):
+    def test_unanimous_parent_yields_a_repo(self):
+        live = {
+            "/ws/bikeindex/alpha": "acme/bike_index",
+            "/ws/bikeindex/beta": "acme/bike_index",
+        }
+        self.assertEqual(P.infer_repos_by_sibling(live), {"/ws/bikeindex": "acme/bike_index"})
+
+    def test_a_parent_holding_several_repos_yields_nothing(self):
+        """~/Sites holds unrelated projects — inferring from one would be a guess."""
+        live = {"/Sites/projA": "me/a", "/Sites/projB": "me/b"}
+        self.assertEqual(P.infer_repos_by_sibling(live), {})
+
+    def test_unresolvable_siblings_are_ignored(self):
+        live = {"/ws/x/alpha": "acme/r", "/ws/x/beta": None}
+        self.assertEqual(P.infer_repos_by_sibling(live), {"/ws/x": "acme/r"})
+
+
+class ResolveAllTests(unittest.TestCase):
+    """The deleted-worktree path: branch from transcripts, repo from siblings."""
+
+    LIVE = "/ws/repo/alive"
+    DEAD = "/ws/repo/deleted"
+
+    def _runner(self, extra=None):
+        responses = {
+            f"-C {self.LIVE} rev-parse --absolute-git-dir": "/main/.git/worktrees/alive",
+            f"-C {self.LIVE} rev-parse --path-format=absolute --git-common-dir": "/main/.git",
+            f"-C {self.LIVE} rev-parse --abbrev-ref HEAD": "feature/live",
+            f"-C {self.LIVE} remote get-url origin": "git@github.com:acme/widgets.git",
+        }
+        responses.update(extra or {})
+
+        def run(args, timeout):
+            line = " ".join(args)
+            for needle, out in responses.items():
+                if needle in line:
+                    return out
+            return None
+        return run
+
+    def test_deleted_worktree_resolves_through_its_recorded_branch(self):
+        prs = ('[{"number": 3850, "title": "Add redesigned registration flow",'
+               '  "state": "MERGED", "url": "u", "headRefName": "sethherr/new-flow"},'
+               ' {"number": 1, "title": "Live one", "state": "OPEN", "url": "u2",'
+               '  "headRefName": "feature/live"}]')
+        rows, stats = P.resolve_all(
+            [self.LIVE, self.DEAD],
+            recorded_branches={self.DEAD: "sethherr/new-flow", self.LIVE: "feature/live"},
+            git_bin="git", gh_bin="gh",
+            runner=self._runner({"pr list --repo acme/widgets --state all": prs}),
+        )
+        by_path = {r["path"]: r for r in rows}
+        self.assertEqual(by_path[self.DEAD]["label"],
+                         "widgets: PR #3850 - Add redesigned registration flow")
+        self.assertEqual(by_path[self.DEAD]["pr_state"], "MERGED")
+        self.assertEqual(by_path[self.DEAD]["inferred"], 1, "repo came from a sibling")
+        self.assertEqual(by_path[self.LIVE]["inferred"], 0)
+        self.assertEqual(stats["live"], 1)
+        self.assertEqual(stats["inferred"], 1)
+        self.assertEqual(stats["with_pr"], 2)
+
+    def test_dead_workspace_without_a_pr_still_names_repo_and_branch(self):
+        rows, _ = P.resolve_all(
+            [self.LIVE, self.DEAD],
+            recorded_branches={self.DEAD: "sethherr/never-pred"},
+            git_bin="git", gh_bin="gh",
+            runner=self._runner({"pr list": "[]"}),
+        )
+        dead = [r for r in rows if r["path"] == self.DEAD][0]
+        self.assertEqual(dead["label"], "widgets: sethherr/never-pred")
+
+    def test_no_sibling_means_no_guess(self):
+        rows, _ = P.resolve_all(
+            ["/elsewhere/orphan"],
+            recorded_branches={"/elsewhere/orphan": "feature/x"},
+            git_bin="git", gh_bin="gh", runner=self._runner(),
+        )
+        self.assertIsNone(rows[0]["label"])
+        self.assertEqual(rows[0]["resolved"], 0)
+
+    def test_generic_branch_names_are_not_attributed_by_inference(self):
+        """`main` exists in every repo — inferring a repo for it proves nothing."""
+        rows, _ = P.resolve_all(
+            [self.LIVE, self.DEAD],
+            recorded_branches={self.DEAD: "main"},
+            git_bin="git", gh_bin="gh", runner=self._runner({"pr list": "[]"}),
+        )
+        dead = [r for r in rows if r["path"] == self.DEAD][0]
+        self.assertIsNone(dead["label"])
+
+    def test_bulk_fetch_is_one_call_per_repo(self):
+        calls = []
+
+        base = self._runner({"pr list": "[]"})
+
+        def spy(args, timeout):
+            line = " ".join(args)
+            if "pr list" in line:
+                calls.append(line)
+            return base(args, timeout)
+
+        P.resolve_all(
+            [self.LIVE, self.DEAD, "/ws/repo/other"],
+            recorded_branches={self.DEAD: "b1", "/ws/repo/other": "b2"},
+            git_bin="git", gh_bin="gh", runner=spy,
+        )
+        bulk = [c for c in calls if "--state all --json number,title,state,url,headRefName" in c]
+        self.assertEqual(len(bulk), 1, "one bulk fetch covers every workspace in the repo")
+
+    def test_bulk_limit_zero_uses_targeted_queries_only(self):
+        calls = []
+
+        def spy(args, timeout):
+            line = " ".join(args)
+            if "pr list" in line:
+                calls.append(line)
+                return '[{"number": 4, "title": "T", "state": "OPEN", "url": "u"}]'
+            return self._runner()(args, timeout)
+
+        rows, stats = P.resolve_all(
+            [self.LIVE, self.DEAD],
+            recorded_branches={self.DEAD: "b1"},
+            git_bin="git", gh_bin="gh", runner=spy, bulk_limit=0,
+        )
+        self.assertTrue(all("headRefName" not in c for c in calls), "no bulk paging")
+        self.assertEqual(stats["pr_lookups"], 2)
+        self.assertEqual(stats["with_pr"], 2)
+
+    def test_targeted_lookups_are_budgeted(self):
+        def runner(args, timeout):
+            if "pr list" in " ".join(args):
+                return '[{"number": 4, "title": "T", "state": "OPEN", "url": "u"}]'
+            return self._runner()(args, timeout)
+
+        paths = [f"/ws/repo/w{i}" for i in range(6)]
+        rows, stats = P.resolve_all(
+            [self.LIVE] + paths,
+            recorded_branches={p: f"branch/{i}" for i, p in enumerate(paths)},
+            git_bin="git", gh_bin="gh", runner=runner, bulk_limit=0, max_lookups=3,
+        )
+        self.assertEqual(stats["pr_lookups"], 3)
+        self.assertEqual(stats["throttled"], 4)  # 6 dead + 1 live, minus 3 allowed
+
+
+class SearchPrTests(unittest.TestCase):
+    HIT = ('[{"number": 108, "title": "Overhaul the port skill", "state": "merged",'
+           '  "url": "u", "repository": {"nameWithOwner": "sethherr/rails_template"}}]')
+
+    def test_finds_the_pr_and_reports_its_repo(self):
+        pr = P.search_pr("sethherr/update-port", gh_bin="gh",
+                         runner=fake_runner({"search prs": self.HIT}))
+        self.assertEqual(pr["number"], 108)
+        self.assertEqual(pr["repo_slug"], "sethherr/rails_template")
+
+    def test_state_is_normalised_to_upper_case(self):
+        """`gh search` returns "merged"; `gh pr list` returns "MERGED"."""
+        pr = P.search_pr("b", gh_bin="gh", runner=fake_runner({"search prs": self.HIT}))
+        self.assertEqual(pr["state"], "MERGED")
+
+    def test_matches_in_two_repos_are_refused(self):
+        both = ('[{"number": 1, "title": "A", "state": "merged", "url": "u",'
+                '  "repository": {"nameWithOwner": "me/a"}},'
+                ' {"number": 2, "title": "B", "state": "merged", "url": "u",'
+                '  "repository": {"nameWithOwner": "me/b"}}]')
+        self.assertIsNone(P.search_pr("shared-name", gh_bin="gh",
+                                      runner=fake_runner({"search prs": both})))
+
+    def test_newest_pr_wins_within_one_repo(self):
+        same = ('[{"number": 5, "title": "Old", "state": "merged", "url": "u",'
+                '  "repository": {"nameWithOwner": "me/a"}},'
+                ' {"number": 9, "title": "New", "state": "open", "url": "u",'
+                '  "repository": {"nameWithOwner": "me/a"}}]')
+        self.assertEqual(P.search_pr("b", gh_bin="gh",
+                                     runner=fake_runner({"search prs": same}))["number"], 9)
+
+    def test_generic_and_blank_branches_never_search(self):
+        calls = []
+
+        def spy(args, timeout):
+            calls.append(args)
+            return self.HIT
+
+        for branch in ("", None, "main", "master"):
+            self.assertIsNone(P.search_pr(branch, gh_bin="gh", runner=spy))
+        self.assertEqual(calls, [])
+
+    def test_owner_scoping_is_passed_through(self):
+        seen = []
+
+        def spy(args, timeout):
+            seen.append(args)
+            return self.HIT
+
+        P.search_pr("b", owners=["sethherr", "bikeindex"], gh_bin="gh", runner=spy)
+        self.assertEqual(seen[0].count("--owner"), 2)
+
+    def test_junk_output_is_none(self):
+        for out in ("not json", "[]", '{"a":1}', ""):
+            self.assertIsNone(P.search_pr("b", gh_bin="gh",
+                                          runner=fake_runner({"search prs": out})))
+
+
+class ResolveAllSearchTierTests(unittest.TestCase):
+    """Workspaces whose repo can't be inferred locally fall back to search."""
+
+    def test_orphan_workspace_is_resolved_by_search(self):
+        hit = ('[{"number": 23, "title": "Bundle luxon", "state": "merged", "url": "u",'
+               '  "repository": {"nameWithOwner": "bikeindex/binxtils"}}]')
+        rows, stats = P.resolve_all(
+            ["/ws/binxtils/lahore-v2"],
+            recorded_branches={"/ws/binxtils/lahore-v2": "sethherr/bundle-luxon"},
+            git_bin="git", gh_bin="gh",
+            runner=fake_runner({"search prs": hit}),
+        )
+        self.assertEqual(rows[0]["label"], "binxtils: PR #23 - Bundle luxon")
+        self.assertEqual(rows[0]["repo_slug"], "bikeindex/binxtils")
+        self.assertEqual(rows[0]["inferred"], 1)
+        self.assertEqual(stats["found_by_search"], 1)
+
+    def test_search_result_is_cached_per_branch(self):
+        hit = ('[{"number": 5, "title": "T", "state": "merged", "url": "u",'
+               '  "repository": {"nameWithOwner": "me/r"}}]')
+        calls = []
+
+        def spy(args, timeout):
+            if "search prs" in " ".join(args):
+                calls.append(args)
+                return hit
+            return None
+
+        P.resolve_all(
+            ["/ws/x/a", "/ws/x/b"],
+            recorded_branches={"/ws/x/a": "same/branch", "/ws/x/b": "same/branch"},
+            git_bin="git", gh_bin="gh", runner=spy,
+        )
+        self.assertEqual(len(calls), 1, "one search serves both workspaces")
+
+    def test_searches_are_budgeted(self):
+        paths = [f"/ws/x/w{i}" for i in range(5)]
+        rows, stats = P.resolve_all(
+            paths,
+            recorded_branches={p: f"b/{i}" for i, p in enumerate(paths)},
+            git_bin="git", gh_bin="gh",
+            runner=fake_runner({"search prs": '[]'}), max_searches=2,
+        )
+        self.assertEqual(stats["searches"], 2)
+        self.assertEqual(stats["throttled"], 3)
