@@ -19,7 +19,7 @@ The test command runs the full offline suite. `scan` refreshes the local SQLite 
 
 ## Coding Style & Naming Conventions
 
-Use Python 3.8+ and the standard library only. Keep files small and single-purpose; split modules that grow beyond roughly 400 lines or mix unrelated concerns. Use four-space indentation, `snake_case` for Python names, and clear route-oriented names for frontend modules such as `overview.js` or `sessions.js`. SQL must use parameter binding for user-reachable values; f-strings in SQL are acceptable only for internal column names or placeholder lists. Add type hints and docstrings when they clarify intent.
+Use Python 3.8+ and the standard library only. Keep files small and single-purpose; split modules that grow beyond roughly 500 lines or mix unrelated concerns (`db.py` and `server.py` are accepted outliers). Use four-space indentation, `snake_case` for Python names, and clear route-oriented names for frontend modules such as `overview.js` or `sessions.js`. SQL must use parameter binding for user-reachable values; f-strings in SQL are acceptable only for internal column names or placeholder lists. Add type hints and docstrings when they clarify intent.
 
 ## Testing Guidelines
 
@@ -27,8 +27,8 @@ Tests use `unittest` and should be deterministic, offline, and fast. Name files 
 
 ## Commit & Pull Request Guidelines
 
-Recent history uses conventional commit prefixes, for example `feat:`, `fix:`, `perf:`, and `chore:`. Keep commit subjects imperative and specific, such as `fix: dedupe streaming snapshots by message id`. Pull requests should describe the user-visible change, note tests run, link related issues, and include screenshots or short recordings for UI changes.
+Recent history uses conventional commit prefixes, for example `feat:`, `fix:`, `perf:`, and `chore:`. Keep commit subjects imperative and specific, such as `fix: dedupe streaming snapshots by message id`. For pull request descriptions see CLAUDE.md § Writing PRs.
 
 ## Security & Configuration Tips
 
-Keep the dashboard local-only. Do not add telemetry or outbound calls for user data. Never commit generated databases or Claude transcript data. Configuration is via `PORT`, `HOST`, `CLAUDE_PROJECTS_DIR`, `TOKEN_DASHBOARD_DB`, and `pricing.json`; avoid binding `HOST=0.0.0.0` unless the network exposure is intentional.
+Keep the dashboard local-only. Do not add telemetry or outbound calls for user data. Never commit generated databases or Claude transcript data. Configuration is via env vars and `pricing.json` — see CLAUDE.md § Customizing for the full list; avoid binding `HOST=0.0.0.0` unless the network exposure is intentional.

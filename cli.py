@@ -29,6 +29,11 @@ def _projects_override(args) -> Optional[str]:
     return args.projects_dir or os.environ.get("CLAUDE_PROJECTS_DIR")
 
 
+def _env_flag(name: str) -> bool:
+    """True for 1/true/yes/on. Anything else, including unset, is False."""
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 def _projects(args, db_path: Optional[str] = None) -> str:
     override = _projects_override(args)
     if override:
@@ -147,7 +152,7 @@ def cmd_dashboard(args):
     host = os.environ.get("HOST", "127.0.0.1")
     port = int(os.environ.get("PORT", "8080"))
     url = f"http://{host}:{port}/"
-    if not args.no_open:
+    if not args.no_open and not _env_flag("NO_AUTO_OPEN_BROWSER"):
         webbrowser.open(url)
     print(f"Token Dashboard listening on {url}")
     run(host, port, db, _projects_override(args))
@@ -168,7 +173,7 @@ def main():
     sub.add_parser("tips",  parents=[common]).set_defaults(func=cmd_tips)
     d = sub.add_parser("dashboard", parents=[common])
     d.add_argument("--no-scan", action="store_true")
-    d.add_argument("--no-open", action="store_true")
+    d.add_argument("--no-open", action="store_true", help="don't open a browser (also NO_AUTO_OPEN_BROWSER=true)")
     d.set_defaults(func=cmd_dashboard)
 
     args = p.parse_args()
