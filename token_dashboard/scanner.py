@@ -581,6 +581,15 @@ def scan_dir(
             if progress:
                 progress(i, total, p, totals)
         conn.commit()
+        if totals["messages"] or totals["tools"]:
+            # Refresh planner statistics on the connection that just did the
+            # writes — PRAGMA optimize re-ANALYZEs only tables whose row count
+            # has moved enough to matter and no-ops otherwise, so it stays
+            # cheap as the DB grows. Without it, stats taken at 200k messages
+            # would still be in force at 2M and could talk the planner out of
+            # the session-window indexes the per-prompt and per-skill
+            # aggregates depend on.
+            conn.execute("PRAGMA optimize")
     summary_started = time.perf_counter()
     if needs_full_summary_rebuild:
         rebuild_summaries(db_path)

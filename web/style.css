@@ -102,6 +102,23 @@ header.topbar {
 /* main */
 main#app { padding: 24px 20px; max-width: 1400px; margin: 0 auto; }
 
+/* route loading state — held back 150ms so fast pages never flash it */
+.route-loading {
+  display: flex; align-items: center; justify-content: center; gap: 10px;
+  padding: 80px 0; color: var(--muted); font-size: 13px;
+  opacity: 0; animation: route-loading-in 140ms ease-out 150ms forwards;
+}
+.route-loading .spinner {
+  width: 16px; height: 16px; border-radius: 50%;
+  border: 2px solid var(--border-2); border-top-color: var(--accent);
+  animation: spin 700ms linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+@keyframes route-loading-in { to { opacity: 1; } }
+@media (prefers-reduced-motion: reduce) {
+  .route-loading .spinner { animation: none; border-top-color: var(--border-2); }
+}
+
 /* card */
 .card {
   background: var(--panel);
@@ -165,6 +182,52 @@ td.num, th.num {
   font-variant-numeric: tabular-nums;
 }
 td.mono { font-family: var(--mono); color: var(--muted); }
+
+/* long tables — scrolling frame + floating collapse toggle (web/tables.js).
+   Heights come from JS as --table-collapsed-h (about 10 rows) and
+   --table-foot-h (the sticky totals row the toggle has to clear). */
+.table-collapsible { position: relative; }
+.table-collapsible.collapsed.scrollable .table-scroll {
+  max-height: var(--table-collapsed-h, 420px);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-2) transparent;
+}
+/* border-collapse drops borders on sticky cells, so the inset shadows stand in
+   for them. The outer shadows extend each cell's background a few px past its
+   edge, into the region the frame clips: without that, a row sliding
+   underneath shows as a hairline against the sticky edge — the compositor
+   moves scrolled content a frame ahead of the sticky cells, and a fractional
+   device-pixel scroll offset leaves a seam even at rest. */
+.table-collapsible.collapsed.scrollable thead th {
+  position: sticky; top: 0; z-index: 2;
+  background: var(--panel);
+  box-shadow: inset 0 -1px 0 var(--border), 0 -6px 0 var(--panel);
+}
+.table-collapsible.collapsed.scrollable tfoot td,
+.table-collapsible.collapsed.scrollable tfoot th {
+  position: sticky; bottom: 0; z-index: 2;
+  background: var(--panel);
+  border-bottom: 0;
+  box-shadow: inset 0 2px 0 var(--border-2), 0 6px 0 var(--panel);
+}
+.table-collapse-toggle {
+  position: absolute; z-index: 3;
+  left: 50%; transform: translateX(-50%);
+  bottom: calc(var(--table-foot-h, 0px) + 4px);
+  padding: 3px 12px;
+  font: 500 11px/1.5 var(--sans);
+  color: var(--muted);
+  background: var(--panel-2);
+  border: 1px solid var(--border-2);
+  border-radius: 999px;
+  cursor: pointer;
+  box-shadow: 0 2px 10px rgba(0,0,0,0.45);
+  transition: color 120ms, border-color 120ms;
+}
+.table-collapse-toggle:hover { color: var(--text); border-color: var(--accent); }
+.table-collapsible:not(.scrollable) .table-collapse-toggle { display: none; }
 
 /* sortable column headers */
 th.sortable {

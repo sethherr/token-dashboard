@@ -59,6 +59,6 @@ def format_for_user(api_cost_usd: float, plan: str, pricing: dict) -> dict:
         return {"display_usd": api_cost_usd, "subtitle": None, "subscription_usd": None}
     return {
         "display_usd":      api_cost_usd,
-        "subtitle":         f"You pay ${p['monthly']}/mo on {p['label']}",
+        "subtitle":         f"You pay ${p['monthly']:,}/mo on {p['label']}",
         "subscription_usd": p["monthly"],
     }

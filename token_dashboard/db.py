@@ -55,6 +55,12 @@ CREATE INDEX IF NOT EXISTS idx_messages_type_model ON messages(type, model);
 CREATE INDEX IF NOT EXISTS idx_messages_timestamp_session ON messages(timestamp, session_id);
 CREATE INDEX IF NOT EXISTS idx_messages_timestamp_project ON messages(timestamp, project_slug);
 CREATE INDEX IF NOT EXISTS idx_messages_type_timestamp_model ON messages(type, timestamp, model);
+-- Session-window probes: "rows of this type in this session between two
+-- timestamps". Every per-prompt and per-skill aggregate is one of these, and
+-- without a session-first index the planner drives off (type, timestamp) and
+-- walks every later message in every other session. Worth 100× on
+-- expensive_prompts and 65× on the skill_* aggregates.
+CREATE INDEX IF NOT EXISTS idx_messages_session_type_ts ON messages(session_id, type, timestamp);
 
 CREATE TABLE IF NOT EXISTS tool_calls (
   id            INTEGER PRIMARY KEY AUTOINCREMENT,

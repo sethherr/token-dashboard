@@ -5,7 +5,7 @@ const USD_PER_TOKEN = 3 / 1_000_000;
 
 function toUsd(tokens) {
   const n = (tokens ?? 0) * USD_PER_TOKEN;
-  return n < 0.01 ? '$' + n.toFixed(4) : '$' + n.toFixed(2);
+  return n < 0.01 ? fmt.usd4(n) : fmt.usd(n);
 }
 
 function today() {

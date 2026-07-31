@@ -232,5 +232,5 @@ function planSubtitle() {
   if (!state.pricing || state.plan === 'api') return '';
   const p = state.pricing.plans[state.plan];
   if (!p || !p.monthly) return '';
-  return `<div class="sub blur-sensitive">pay $${p.monthly}/mo on ${fmt.htmlSafe(p.label)}</div>`;
+  return `<div class="sub blur-sensitive">pay $${fmt.int(p.monthly)}/mo on ${fmt.htmlSafe(p.label)}</div>`;
 }
