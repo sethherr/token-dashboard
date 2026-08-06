@@ -8,7 +8,7 @@ Each integration was reviewed for security concerns (OWASP-style checks for SQL 
 
 ## Seth's PRs
 
-Changes made in [sethherr/token-dashboard](https://github.com/sethherr/token-dashboard), a fork of this fork — held to the same bar as the integrations below: security-reviewed, tests green (`python3 -m unittest discover tests`).
+Changes made in [sethherr/token-dashboard](https://github.com/sethherr/token-dashboard), a fork of [this fork](https://github.com/muckybuzzwoo/token-dashboard) — held to the same bar as the integrations below: security-reviewed, tests green (`python3 -m unittest discover tests`).
 
 | PR | Title | Highlights |
 |---|---|---|
